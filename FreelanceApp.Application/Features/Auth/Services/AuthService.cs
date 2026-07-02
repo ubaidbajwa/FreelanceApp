@@ -23,15 +23,18 @@ public class AuthService(
 {
     private readonly JwtSettings _jwtSettings = jwtOptions.Value;
 
-    public async Task<AuthResponseDto> RegisterAsync(RegisterRequestDto dto)
+    public async Task RegisterAsync(RegisterRequestDto dto)
     {
-        // ... (Aapka purana RegisterAsync code bilkul theek hai, wahi rahega)
         logger.LogInformation("Register attempt for email: {Email}", dto.Email);
         var normalizedEmail = dto.Email.ToLower().Trim();
 
+        // SILENT FAILURE — enumeration protection. A 409 here would let an
+        // attacker probe which emails are registered, so the response is
+        // identical whether the account was created or already existed.
         if (await userRepository.EmailExistsAsync(normalizedEmail))
         {
-            throw new ConflictException("Email is already registered");
+            logger.LogWarning("Register — email already exists: {Email} (silent fail)", normalizedEmail);
+            return;
         }
 
         var user = new User
@@ -49,9 +52,10 @@ public class AuthService(
         await userRepository.AddAsync(user);
         await userRepository.SaveChangesAsync();
 
+        // No tokens issued here — the user gets them from login after
+        // verifying their email. Handing out tokens at register would let
+        // unverified accounts bypass the email-verification gate on login.
         await otpService.GenerateAndSendAsync(user.Id, user.Email, user.FullName, OtpPurpose.EmailVerification);
-
-        return await BuildAuthResponseAsync(user);
     }
 
     public async Task<AuthResponseDto> LoginAsync(LoginRequestDto dto)
@@ -69,6 +73,16 @@ public class AuthService(
         {
             user.PasswordHash = passwordHasher.HashPassword(dto.Password);
             await userRepository.SaveChangesAsync();
+        }
+
+        // Checked AFTER password verification on purpose: a wrong-password
+        // attacker sees the same generic 401 and can't use this message to
+        // probe whether an email is registered.
+        if (!user.IsEmailVerified)
+        {
+            logger.LogWarning("Login blocked — email not verified for user: {UserId}", user.Id);
+            throw new ForbiddenException(
+                "Please verify your email before logging in. Use resend-otp to get a new code.");
         }
 
         return await BuildAuthResponseAsync(user);
@@ -323,5 +337,42 @@ public class AuthService(
         logger.LogInformation(
             "Password reset successful for user: {UserId} | All sessions revoked",
             user.Id);
+    }
+
+    public async Task<AuthResponseDto> ChangePasswordAsync(Guid userId, ChangePasswordRequestDto dto)
+    {
+        logger.LogInformation("Change password attempt for user: {UserId}", userId);
+
+        var user = await userRepository.GetByIdAsync(userId);
+        if (user == null) throw new UnauthorizedException("User not found");
+
+        // User is already authenticated (JWT), but re-verifying the current
+        // password blocks an attacker holding a stolen access token from
+        // locking the real owner out of their account.
+        if (!passwordHasher.VerifyPassword(dto.CurrentPassword, user.PasswordHash))
+        {
+            logger.LogWarning("Change password failed — wrong current password for user: {UserId}", userId);
+            throw new UnauthorizedException("Current password is incorrect");
+        }
+
+        if (dto.CurrentPassword == dto.NewPassword)
+        {
+            throw new ConflictException("New password must be different from the current password");
+        }
+
+        // New password + new SecurityStamp = all other sessions revoked.
+        // Middleware checks the stamp on every request, so the caller's own
+        // tokens die too — that's why we return a fresh token pair below,
+        // keeping the current device logged in.
+        user.PasswordHash = passwordHasher.HashPassword(dto.NewPassword);
+        user.SecurityStamp = Guid.NewGuid();
+
+        await userRepository.SaveChangesAsync();
+
+        logger.LogInformation(
+            "Password changed successfully for user: {UserId} | Other sessions revoked",
+            user.Id);
+
+        return await BuildAuthResponseAsync(user);
     }
 }

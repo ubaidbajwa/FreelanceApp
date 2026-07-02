@@ -116,6 +116,12 @@ if (string.IsNullOrWhiteSpace(jwtSettings.Secret))
 builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
     .AddJwtBearer(options =>
     {
+        // .NET 8 uses JsonWebTokenHandler (not JwtSecurityTokenHandler), so the
+        // DefaultInboundClaimTypeMap.Clear() above doesn't reach it. Without this,
+        // "sub" gets remapped to ClaimTypes.NameIdentifier and the SecurityStamp
+        // check below fails every token with "Missing required claims".
+        options.MapInboundClaims = false;
+
         options.TokenValidationParameters = new TokenValidationParameters
         {
             ValidateIssuer = true,
@@ -205,14 +211,31 @@ builder.Services.AddFluentValidationAutoValidation();
 // Service registrations
 builder.Services.AddScoped<IPasswordHasher, BCryptPasswordHasher>();
 
-// CORS setup — Flutter aur web panel ke liye
+// CORS setup — web frontends ke liye (Flutter mobile ko CORS lagta hi nahi,
+// ye sirf browser-based clients par apply hota hai)
+// Production: Cors:AllowedOrigins mein frontend domains set karein
+// (e.g. ["https://app.example.com"]). Origins configure na hon toh
+// production mein koi cross-origin request allow nahi hoti.
+var allowedOrigins = builder.Configuration
+    .GetSection("Cors:AllowedOrigins").Get<string[]>() ?? [];
+
 builder.Services.AddCors(options =>
 {
     options.AddPolicy("AllowFrontend", policy =>
     {
-        policy.AllowAnyOrigin()
-              .AllowAnyMethod()
-              .AllowAnyHeader();
+        if (allowedOrigins.Length > 0)
+        {
+            policy.WithOrigins(allowedOrigins)
+                  .AllowAnyMethod()
+                  .AllowAnyHeader();
+        }
+        else if (builder.Environment.IsDevelopment())
+        {
+            // Dev-only fallback: local testing without origin config
+            policy.AllowAnyOrigin()
+                  .AllowAnyMethod()
+                  .AllowAnyHeader();
+        }
     });
 });
 

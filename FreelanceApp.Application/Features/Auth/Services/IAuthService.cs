@@ -4,7 +4,7 @@ namespace FreelanceApp.Application.Features.Auth.Services;
 
 public interface IAuthService
 {
-    Task<AuthResponseDto> RegisterAsync(RegisterRequestDto dto);
+    Task RegisterAsync(RegisterRequestDto dto);
     Task<AuthResponseDto> LoginAsync(LoginRequestDto dto);
     Task<AuthResponseDto> RefreshAsync(RefreshTokenRequestDto dto);
     Task LogoutAsync(LogoutRequestDto dto);
@@ -13,4 +13,6 @@ public interface IAuthService
     Task ForgotPasswordAsync(ForgotPasswordRequestDto dto);
 
     Task ResetPasswordAsync(ResetPasswordRequestDto dto);
+
+    Task<AuthResponseDto> ChangePasswordAsync(Guid userId, ChangePasswordRequestDto dto);
 }

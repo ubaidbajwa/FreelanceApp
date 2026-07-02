@@ -1,7 +1,9 @@
 ﻿using FreelanceApp.Application.Features.Auth.DTOs;
 using FreelanceApp.Application.Features.Auth.Services;
+using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.RateLimiting;
+using System.Security.Claims;
 
 namespace FreelanceApp.Api.Controllers;
 
@@ -13,8 +15,10 @@ public class AuthController(IAuthService authService) : ControllerBase
     [HttpPost("register")]
     public async Task<IActionResult> Register([FromBody] RegisterRequestDto dto)
     {
-        AuthResponseDto result = await authService.RegisterAsync(dto);
-        return CreatedAtAction(nameof(Register), new { id = result.User.Id }, result);
+        await authService.RegisterAsync(dto);
+        // Same response whether the account was created or the email already
+        // existed — prevents user enumeration.
+        return Ok(new { message = "Registration received. If the email is new, a verification code has been sent to it." });
     }
 
     [HttpPost("login")]
@@ -64,5 +68,19 @@ public class AuthController(IAuthService authService) : ControllerBase
     {
         await authService.ResetPasswordAsync(dto);
         return Ok(new { message = "Password reset successful. Please login with your new password." });
+    }
+
+    [Authorize]
+    [HttpPost("change-password")]
+    public async Task<IActionResult> ChangePassword([FromBody] ChangePasswordRequestDto dto)
+    {
+        var userIdClaim = User.FindFirst("sub")?.Value
+                       ?? User.FindFirst(ClaimTypes.NameIdentifier)?.Value;
+
+        if (string.IsNullOrEmpty(userIdClaim) || !Guid.TryParse(userIdClaim, out var userId))
+            return Unauthorized(new { message = "Invalid user token" });
+
+        var result = await authService.ChangePasswordAsync(userId, dto);
+        return Ok(result);
     }
 }
