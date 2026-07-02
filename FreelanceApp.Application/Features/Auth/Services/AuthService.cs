@@ -76,12 +76,22 @@ public class AuthService(
 
     public async Task<AuthResponseDto> RefreshAsync(RefreshTokenRequestDto dto)
     {
-        // ... (Aapka purana RefreshAsync code wahi rahega)
-        var userId = await refreshTokenService.ValidateAndConsumeAsync(dto.RefreshToken);
-        if (userId == null) throw new UnauthorizedException("Invalid or expired refresh token");
+        var payload = await refreshTokenService.ValidateAndConsumeAsync(dto.RefreshToken);
+        if (payload == null) throw new UnauthorizedException("Invalid or expired refresh token");
 
-        var user = await userRepository.GetByIdAsync(userId.Value);
+        var user = await userRepository.GetByIdAsync(payload.UserId);
         if (user == null) throw new UnauthorizedException("User not found");
+
+        // Stamp mismatch = password reset (or admin revocation) happened after
+        // this token was issued. Without this check a stolen refresh token would
+        // survive a password reset and mint fresh sessions under the new stamp.
+        if (payload.SecurityStamp != user.SecurityStamp)
+        {
+            logger.LogWarning(
+                "Refresh rejected — stale SecurityStamp for user: {UserId} (session revoked)",
+                user.Id);
+            throw new UnauthorizedException("Session revoked. Please login again.");
+        }
 
         return await BuildAuthResponseAsync(user);
     }
@@ -93,9 +103,8 @@ public class AuthService(
 
     private async Task<AuthResponseDto> BuildAuthResponseAsync(User user)
     {
-        // ... (Aapka purana BuildAuthResponseAsync code wahi rahega)
         var accessToken = jwtTokenService.GenerateAccessToken(user);
-        var refreshToken = await refreshTokenService.GenerateAsync(user.Id);
+        var refreshToken = await refreshTokenService.GenerateAsync(user.Id, user.SecurityStamp);
 
         return new AuthResponseDto
         {

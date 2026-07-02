@@ -17,6 +17,7 @@ using Microsoft.IdentityModel.Tokens;
 using System.Text;
 using FreelanceApp.Api.Services;
 using FreelanceApp.Application.Features.Kyc.Services;
+using System.Threading.RateLimiting;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -94,6 +95,12 @@ builder.Services.AddScoped<IImageStorageService, CloudinaryImageService>();
 
 builder.Services.AddScoped<IKycRepository, KycRepository>();
 builder.Services.AddScoped<IKycService, KycService>();
+builder.Services.AddScoped<IAdminKycService, AdminKycService>();
+builder.Services.AddScoped<IAdminUserService, AdminUserService>();
+
+// Admin Settings binding
+builder.Services.Configure<AdminSettings>(
+    builder.Configuration.GetSection(AdminSettings.SectionName));
 
 // JWT Authentication
 var jwtSettings = builder.Configuration
@@ -209,6 +216,35 @@ builder.Services.AddCors(options =>
     });
 });
 
+// Rate limiting — brute-force protection on auth endpoints
+// Per-IP fixed window: 10 requests/minute covers a legit signup flow
+// (register → verify-email → resend-otp) while blocking credential stuffing.
+builder.Services.AddRateLimiter(options =>
+{
+    options.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
+
+    options.OnRejected = async (context, ct) =>
+    {
+        context.HttpContext.Response.ContentType = "application/problem+json";
+        await context.HttpContext.Response.WriteAsJsonAsync(new
+        {
+            status = 429,
+            title = "Too Many Requests",
+            detail = "Too many attempts. Please wait a minute and try again."
+        }, ct);
+    };
+
+    options.AddPolicy("auth", httpContext =>
+        RateLimitPartition.GetFixedWindowLimiter(
+            partitionKey: httpContext.Connection.RemoteIpAddress?.ToString() ?? "unknown",
+            factory: _ => new FixedWindowRateLimiterOptions
+            {
+                PermitLimit = 10,
+                Window = TimeSpan.FromMinutes(1),
+                QueueLimit = 0
+            }));
+});
+
 var app = builder.Build();
 
 // Exception handler MUST be first in pipeline
@@ -226,13 +262,16 @@ app.UseHttpsRedirection();
 // 1. Pehle Routing aayegi
 app.UseRouting();
 
-// 2. Phir CORS aayega
+// 2. Rate limiter — routing ke baad taake endpoint policies match ho sakein
+app.UseRateLimiter();
+
+// 3. Phir CORS aayega
 app.UseCors("AllowFrontend");
 
-// 3. Phir Authentication aayegi
+// 4. Phir Authentication aayegi
 app.UseAuthentication();
 
-// 4. Phir Authorization aayegi
+// 5. Phir Authorization aayegi
 app.UseAuthorization();
 
 app.MapControllers();

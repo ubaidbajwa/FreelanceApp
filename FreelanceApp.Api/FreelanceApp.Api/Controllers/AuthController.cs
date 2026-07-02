@@ -1,11 +1,13 @@
 ﻿using FreelanceApp.Application.Features.Auth.DTOs;
 using FreelanceApp.Application.Features.Auth.Services;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.RateLimiting;
 
 namespace FreelanceApp.Api.Controllers;
 
 [ApiController]
 [Route("api/auth")]
+[EnableRateLimiting("auth")]
 public class AuthController(IAuthService authService) : ControllerBase
 {
     [HttpPost("register")]

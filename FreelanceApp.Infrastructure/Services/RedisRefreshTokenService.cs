@@ -16,43 +16,47 @@ public class RedisRefreshTokenService(
     private IDatabase Db => redis.GetDatabase();
     private const string KeyPrefix = "refresh_token:";
 
-    public async Task<string> GenerateAsync(Guid userId)
+    public async Task<string> GenerateAsync(Guid userId, Guid securityStamp)
     {
         // Cryptographically secure random token
         var tokenBytes = RandomNumberGenerator.GetBytes(64);
         var token = Convert.ToBase64String(tokenBytes);
 
-        // Redis mein store: key = token, value = userId, TTL = 7 days
+        // Redis mein store: key = token, value = "userId:securityStamp", TTL = 7 days
+        // Stamp binding: password reset rotates the stamp, making this token useless
         var key = KeyPrefix + token;
         var expiry = TimeSpan.FromDays(_settings.RefreshTokenExpiryDays);
 
-        await Db.StringSetAsync(key, userId.ToString(), expiry);
+        await Db.StringSetAsync(key, $"{userId}:{securityStamp}", expiry);
 
         logger.LogInformation("Refresh token generated for user: {UserId}", userId);
         return token;
     }
 
-    public async Task<Guid?> ValidateAndConsumeAsync(string refreshToken)
+    public async Task<RefreshTokenPayload?> ValidateAndConsumeAsync(string refreshToken)
     {
         var key = KeyPrefix + refreshToken;
 
         // Atomic: get + delete in one operation
-        var userIdValue = await Db.StringGetDeleteAsync(key);
+        var storedValue = await Db.StringGetDeleteAsync(key);
 
-        if (userIdValue.IsNullOrEmpty)
+        if (storedValue.IsNullOrEmpty)
         {
             logger.LogWarning("Invalid or expired refresh token used");
             return null;
         }
 
-        if (!Guid.TryParse(userIdValue.ToString(), out var userId))
+        var parts = storedValue.ToString().Split(':');
+        if (parts.Length != 2 ||
+            !Guid.TryParse(parts[0], out var userId) ||
+            !Guid.TryParse(parts[1], out var securityStamp))
         {
             logger.LogError("Corrupt refresh token data in Redis");
             return null;
         }
 
         logger.LogInformation("Refresh token validated and consumed for user: {UserId}", userId);
-        return userId;
+        return new RefreshTokenPayload(userId, securityStamp);
     }
 
     public async Task RevokeAsync(string refreshToken)
@@ -64,16 +68,14 @@ public class RedisRefreshTokenService(
 
     public Task RevokeAllForUserAsync(Guid userId)
     {
-        // Token Versioning approach:
-        // Refresh tokens automatically become useless after password reset
-        // because the access token's SecurityStamp won't match the user's new stamp.
-        // The middleware (JWT OnTokenValidated event) handles invalidation.
-        //
-        // Refresh tokens themselves expire naturally after 7 days (their TTL in Redis).
-        // No explicit per-user revocation needed — SecurityStamp does the work.
+        // Stamp binding makes this a no-op: each refresh token stores the
+        // SecurityStamp it was issued under, and AuthService.RefreshAsync rejects
+        // any token whose stamp no longer matches the user's current stamp.
+        // Rotating the stamp (password reset, admin action) therefore revokes
+        // all outstanding refresh tokens without touching Redis.
 
         logger.LogInformation(
-            "RevokeAllForUserAsync called for user: {UserId} | Token Versioning handles invalidation via SecurityStamp",
+            "RevokeAllForUserAsync called for user: {UserId} | Stamp binding handles invalidation",
             userId);
         return Task.CompletedTask;
     }
