@@ -12,8 +12,8 @@ class _SplashScreenState extends State<SplashScreen> {
   @override
   void initState() {
     super.initState();
-    // 3 second baad onboarding pe le jao (runs once when screen is born)
-    Future.delayed(const Duration(seconds: 3), () {
+    // 2 second baad onboarding pe le jao (runs once when screen is born)
+    Future.delayed(const Duration(seconds: 2), () {
       if (mounted) context.go('/onboarding');
     });
   }
