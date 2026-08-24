@@ -14,16 +14,16 @@ public class OtpService : IOtpService
     private const int OtpExpiryMinutes = 10;
 
     private readonly AppDbContext _db;
-    private readonly IEmailService _emailService;
+    private readonly IEmailQueue _emailQueue;
     private readonly ILogger<OtpService> _logger;
 
     public OtpService(
         AppDbContext db,
-        IEmailService emailService,
+        IEmailQueue emailQueue,
         ILogger<OtpService> logger)
     {
         _db = db;
-        _emailService = emailService;
+        _emailQueue = emailQueue;
         _logger = logger;
     }
 
@@ -60,22 +60,17 @@ public class OtpService : IOtpService
             "OTP generated for user {UserId} | Purpose: {Purpose}",
             userId, purpose);
 
-        // Step 4: Send email
+        // Step 4: Enqueue email — SMTP send background mein hoga (EmailBackgroundService).
+        // Yahan await nahi — request thread turant free ho jata hai.
         var subject = purpose == OtpPurpose.EmailVerification
             ? "Verify your email — Freelance Job Finder"
             : "Reset your password — Freelance Job Finder";
 
-        // ⬇️ UPDATED — purpose ke hisaab se template
         var htmlBody = purpose == OtpPurpose.EmailVerification
             ? EmailTemplates.EmailVerificationOtp(userName, code, OtpExpiryMinutes)
             : EmailTemplates.PasswordResetOtp(userName, code, OtpExpiryMinutes);
 
-        await _emailService.SendAsync(
-            toEmail: userEmail,
-            toName: userName,
-            subject: subject,
-            htmlBody: htmlBody,
-            ct: ct);
+        _emailQueue.Enqueue(new EmailQueueItem(userEmail, userName, subject, htmlBody));
     }
 
     private async Task InvalidateOldOtpsAsync(

@@ -1,5 +1,6 @@
 ﻿using FreelanceApp.Application.Interfaces.Repositories;
 using FreelanceApp.Domain.Entities;
+using FreelanceApp.Domain.Enums;
 using FreelanceApp.Infrastructure.Persistence;
 using Microsoft.EntityFrameworkCore;
 
@@ -23,6 +24,12 @@ public class UserRepository : IUserRepository
     {
         return await _context.Users
             .FirstOrDefaultAsync(u => u.Email == email);
+    }
+
+    public async Task<User?> GetByExternalIdAsync(AuthProvider provider, string externalId)
+    {
+        return await _context.Users
+            .FirstOrDefaultAsync(u => u.Provider == provider && u.ExternalId == externalId);
     }
 
     public async Task<bool> EmailExistsAsync(string email)

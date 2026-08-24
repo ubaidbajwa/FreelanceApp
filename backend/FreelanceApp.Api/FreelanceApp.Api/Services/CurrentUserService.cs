@@ -22,8 +22,9 @@ public class CurrentUserService(IHttpContextAccessor httpContextAccessor)
     public string? Email =>
         User?.FindFirstValue(JwtRegisteredClaimNames.Email);
 
+    // Primary role only (default experience) — do not use for permission checks.
     public string? Role =>
-        User?.FindFirstValue("role");
+        User?.FindFirstValue("primary_role");
 
     public bool IsIdentityVerified
     {

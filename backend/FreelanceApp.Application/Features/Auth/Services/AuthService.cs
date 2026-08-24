@@ -1,7 +1,9 @@
 ﻿using System;
+using FreelanceApp.Application.Common.Capabilities;
 using FreelanceApp.Application.Common.Settings;
 using FreelanceApp.Application.Exceptions;
 using FreelanceApp.Application.Features.Auth.DTOs;
+using FreelanceApp.Application.Features.Profiles;
 using FreelanceApp.Application.Interfaces.Repositories;
 using FreelanceApp.Application.Interfaces.Services;
 using FreelanceApp.Domain.Entities;
@@ -19,6 +21,9 @@ public class AuthService(
     IOptions<JwtSettings> jwtOptions,
     IOtpService otpService,
     IEmailOtpRepository otpRepository, // ⬅️ DbContext ki jagah Repository aa gayi
+    IProfileRepository profileRepository, // capabilities compute karne ke liye (CanFreelance)
+    ICaptchaVerifier captchaVerifier,
+    IGoogleTokenVerifier googleTokenVerifier,
     ILogger<AuthService> logger) : IAuthService
 {
     private readonly JwtSettings _jwtSettings = jwtOptions.Value;
@@ -26,15 +31,25 @@ public class AuthService(
     public async Task RegisterAsync(RegisterRequestDto dto)
     {
         logger.LogInformation("Register attempt for email: {Email}", dto.Email);
+
+        // Captcha check runs BEFORE any DB lookup or user creation so bots
+        // can't even probe email-existence or spend our resources. Verifier
+        // fails closed (returns false) on network errors.
+        if (!await captchaVerifier.VerifyAsync(dto.CaptchaToken, CancellationToken.None))
+        {
+            logger.LogWarning("Register — captcha verification failed for email: {Email}", dto.Email);
+            throw new ValidationException("Captcha verification failed");
+        }
+
         var normalizedEmail = dto.Email.ToLower().Trim();
 
-        // SILENT FAILURE — enumeration protection. A 409 here would let an
-        // attacker probe which emails are registered, so the response is
-        // identical whether the account was created or already existed.
+        // Product decision (2026-07): duplicate email ka error signup pe hi
+        // dikhana hai (LinkedIn-style UX). Enumeration ka bachao ab sirf rate
+        // limiting se hai — /check-email endpoint bhi yehi reveal karta hai.
         if (await userRepository.EmailExistsAsync(normalizedEmail))
         {
-            logger.LogWarning("Register — email already exists: {Email} (silent fail)", normalizedEmail);
-            return;
+            logger.LogWarning("Register — email already exists: {Email}", normalizedEmail);
+            throw new ConflictException("An account with this email already exists. Try signing in instead.");
         }
 
         var user = new User
@@ -43,7 +58,7 @@ public class AuthService(
             Email = normalizedEmail,
             PasswordHash = passwordHasher.HashPassword(dto.Password),
             FullName = dto.FullName.Trim(),
-            Role = dto.Role,
+            PrimaryRole = dto.Role, // request field "role" → primary role (default experience)
             IsIdentityVerified = false,
             SecurityStamp = Guid.NewGuid(),
             CreatedAt = DateTime.UtcNow
@@ -52,10 +67,22 @@ public class AuthService(
         await userRepository.AddAsync(user);
         await userRepository.SaveChangesAsync();
 
-        // No tokens issued here — the user gets them from login after
-        // verifying their email. Handing out tokens at register would let
-        // unverified accounts bypass the email-verification gate on login.
+        // No tokens issued here — the user gets them from login after verifying their
+        // email. Handing out tokens at register would let unverified accounts bypass
+        // the email-verification gate on login.
+        //
+        // GenerateAndSendAsync persists the OTP row to DB, then enqueues the email
+        // (EmailBackgroundService sends it). No SMTP wait here — the response returns
+        // as soon as the OTP is committed.
         await otpService.GenerateAndSendAsync(user.Id, user.Email, user.FullName, OtpPurpose.EmailVerification);
+    }
+
+    // Signup step 0 ka instant check — "Agree & Join" pe hi pata chal jaye
+    // ke email pehle se registered hai (OTP tak intezar nahi)
+    public async Task<bool> EmailExistsAsync(string email)
+    {
+        var normalizedEmail = email.ToLower().Trim();
+        return await userRepository.EmailExistsAsync(normalizedEmail);
     }
 
     public async Task<AuthResponseDto> LoginAsync(LoginRequestDto dto)
@@ -64,7 +91,24 @@ public class AuthService(
         var normalizedEmail = dto.Email.ToLower().Trim();
         var user = await userRepository.GetByEmailAsync(normalizedEmail);
 
-        if (user == null || !passwordHasher.VerifyPassword(dto.Password, user.PasswordHash))
+        if (user == null)
+        {
+            throw new UnauthorizedException("Invalid email or password");
+        }
+
+        // Social-login accounts (Google/MS/Apple) have no PasswordHash. Guard
+        // BEFORE BCrypt.Verify — a null hash makes it throw (→ 500). Point the
+        // user at the right door instead of a generic failure.
+        if (user.PasswordHash is null)
+        {
+            logger.LogWarning(
+                "Login blocked — password login attempted on {Provider} account: {UserId}",
+                user.Provider, user.Id);
+            throw new UnauthorizedException(
+                $"This account uses {user.Provider} Sign-In. Please continue with {user.Provider}.");
+        }
+
+        if (!passwordHasher.VerifyPassword(dto.Password, user.PasswordHash))
         {
             throw new UnauthorizedException("Invalid email or password");
         }
@@ -83,6 +127,80 @@ public class AuthService(
             logger.LogWarning("Login blocked — email not verified for user: {UserId}", user.Id);
             throw new ForbiddenException(
                 "Please verify your email before logging in. Use resend-otp to get a new code.");
+        }
+
+        return await BuildAuthResponseAsync(user);
+    }
+
+    public async Task<AuthResponseDto> GoogleLoginAsync(GoogleLoginRequest request, CancellationToken ct = default)
+    {
+        logger.LogInformation("Google login attempt");
+
+        // Verifier fails closed: a bad signature, wrong audience, expired token,
+        // or even a network error fetching Google's certs all return null. We map
+        // that to a 401 (via UnauthorizedException) so a garbage token can never
+        // surface as a 500.
+        var payload = await googleTokenVerifier.VerifyAsync(request.IdToken, ct);
+        if (payload is null)
+        {
+            logger.LogWarning("Google login — token verification failed");
+            throw new UnauthorizedException("Invalid Google token");
+        }
+
+        // Google itself says this email isn't verified — don't trust it for
+        // matching or account creation. Otherwise someone could sign in with an
+        // unverified Google email that happens to match a real user and hijack it.
+        if (!payload.EmailVerified)
+        {
+            logger.LogWarning("Google login — email not verified by Google for subject: {Subject}", payload.Subject);
+            throw new UnauthorizedException("Your Google email address is not verified.");
+        }
+
+        var normalizedEmail = payload.Email.ToLower().Trim();
+
+        // 1) Returning Google user — matched on Google's stable subject id, which
+        //    never changes even if the user later changes their email.
+        var user = await userRepository.GetByExternalIdAsync(AuthProvider.Google, payload.Subject);
+
+        // 2) First Google login, but this email already has an account — link the
+        //    Google identity to it instead of creating a duplicate. The password
+        //    hash (if any) is kept, so an existing local account can still use both.
+        if (user is null)
+        {
+            user = await userRepository.GetByEmailAsync(normalizedEmail);
+            if (user is not null)
+            {
+                user.Provider = AuthProvider.Google;
+                user.ExternalId = payload.Subject;
+                user.IsEmailVerified = true; // Google already verified ownership
+                await userRepository.SaveChangesAsync();
+                logger.LogInformation("Google login — linked Google identity to existing user: {UserId}", user.Id);
+            }
+        }
+
+        // 3) Brand-new user — create a social-only account (no password hash).
+        if (user is null)
+        {
+            user = new User
+            {
+                Id = Guid.NewGuid(),
+                Email = normalizedEmail,
+                PasswordHash = null, // social account — no local password
+                FullName = string.IsNullOrWhiteSpace(payload.FullName)
+                    ? normalizedEmail
+                    : payload.FullName.Trim(),
+                Provider = AuthProvider.Google,
+                ExternalId = payload.Subject,
+                PrimaryRole = UserRole.Freelancer,
+                IsIdentityVerified = false,
+                IsEmailVerified = true, // Google already verified the email
+                SecurityStamp = Guid.NewGuid(),
+                CreatedAt = DateTime.UtcNow
+            };
+
+            await userRepository.AddAsync(user);
+            await userRepository.SaveChangesAsync();
+            logger.LogInformation("Google login — created new social user: {UserId}", user.Id);
         }
 
         return await BuildAuthResponseAsync(user);
@@ -120,6 +238,12 @@ public class AuthService(
         var accessToken = jwtTokenService.GenerateAccessToken(user);
         var refreshToken = await refreshTokenService.GenerateAsync(user.Id, user.SecurityStamp);
 
+        // Capabilities computed, never stored — CanFreelance needs profile completion.
+        var profile = await profileRepository.GetByUserIdAsync(user.Id);
+        var capabilities = UserCapabilities.Evaluate(
+            profileExists: profile != null,
+            completionPercent: profile != null ? ProfileCompletionCalculator.Calculate(profile) : 0);
+
         return new AuthResponseDto
         {
             AccessToken = accessToken,
@@ -131,9 +255,10 @@ public class AuthService(
                 Id = user.Id,
                 Email = user.Email,
                 FullName = user.FullName,
-                Role = user.Role.ToString(),
+                Role = user.PrimaryRole.ToString(), // field name unchanged; value = primary role
                 IsIdentityVerified = user.IsIdentityVerified,
-                CreatedAt = user.CreatedAt
+                CreatedAt = user.CreatedAt,
+                Capabilities = capabilities
             }
         };
     }
@@ -345,6 +470,16 @@ public class AuthService(
 
         var user = await userRepository.GetByIdAsync(userId);
         if (user == null) throw new UnauthorizedException("User not found");
+
+        // Social-login accounts have no local password to verify or change.
+        if (user.PasswordHash is null)
+        {
+            logger.LogWarning(
+                "Change password blocked — {Provider} account has no local password: {UserId}",
+                user.Provider, userId);
+            throw new ConflictException(
+                $"This account uses {user.Provider} Sign-In and has no password to change.");
+        }
 
         // User is already authenticated (JWT), but re-verifying the current
         // password blocks an attacker holding a stolen access token from

@@ -16,7 +16,14 @@ using FreelanceApp.Application.Common.Settings;
 using Microsoft.IdentityModel.Tokens;
 using System.Text;
 using FreelanceApp.Api.Services;
+using FreelanceApp.Api.Hubs;
+using Microsoft.AspNetCore.SignalR;
 using FreelanceApp.Application.Features.Kyc.Services;
+using FreelanceApp.Application.Features.Profiles.Services;
+using FreelanceApp.Application.Features.Connections.Services;
+using FreelanceApp.Application.Features.Network.Services;
+using FreelanceApp.Application.Features.People.Services;
+using FreelanceApp.Application.Features.Messaging.Services;
 using System.Threading.RateLimiting;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -50,6 +57,22 @@ builder.Services.AddScoped<IEmailOtpRepository, EmailOtpRepository>();
 // AuthService registration
 builder.Services.AddScoped<IAuthService, AuthService>();
 
+// Captcha — options bound from "Captcha" section (secrets via user-secrets /
+// env vars, NOT appsettings). Typed HttpClient gives us a pooled handler +
+// a 5s ceiling on the siteverify round-trip.
+builder.Services.Configure<CaptchaOptions>(
+    builder.Configuration.GetSection(CaptchaOptions.SectionName));
+
+builder.Services.AddHttpClient<ICaptchaVerifier, GoogleCaptchaVerifier>(client =>
+{
+    client.Timeout = TimeSpan.FromSeconds(5);
+});
+
+// Google Sign-In — accepted client IDs bound from "GoogleAuth" section.
+builder.Services.Configure<GoogleAuthSettings>(
+    builder.Configuration.GetSection(GoogleAuthSettings.SectionName));
+builder.Services.AddScoped<IGoogleTokenVerifier, GoogleTokenVerifier>();
+
 // Global exception handling (RFC 7807 ProblemDetails)
 builder.Services.AddExceptionHandler<GlobalExceptionHandler>();
 builder.Services.AddProblemDetails();
@@ -68,8 +91,14 @@ builder.Services.AddScoped<IJwtTokenService, JwtTokenService>();
 builder.Services.Configure<EmailSettings>(
     builder.Configuration.GetSection(EmailSettings.SectionName));
 
-// Email Service
+// Email Service (scoped — new SmtpClient per call; used by EmailBackgroundService via scope)
 builder.Services.AddScoped<IEmailService, SmtpEmailService>();
+
+// Email queue + background sender — singleton channel, BackgroundService drains it.
+// Requests enqueue and return immediately; SMTP runs off the request thread.
+builder.Services.AddSingleton<EmailQueueService>();
+builder.Services.AddSingleton<IEmailQueue>(sp => sp.GetRequiredService<EmailQueueService>());
+builder.Services.AddHostedService<EmailBackgroundService>();
 
 // OTP Service
 builder.Services.AddScoped<IOtpService, OtpService>();
@@ -95,6 +124,55 @@ builder.Services.AddScoped<IImageStorageService, CloudinaryImageService>();
 
 builder.Services.AddScoped<IKycRepository, KycRepository>();
 builder.Services.AddScoped<IKycService, KycService>();
+
+// Profile module
+builder.Services.AddScoped<IProfileRepository, ProfileRepository>();
+builder.Services.AddScoped<IProfileService, ProfileService>();
+
+// Connections module
+builder.Services.AddScoped<IConnectionRepository, ConnectionRepository>();
+builder.Services.AddScoped<IConnectionService, ConnectionService>();
+
+// Network module
+builder.Services.AddScoped<INetworkService, NetworkService>();
+
+// Suggestions module
+builder.Services.Configure<SuggestionSettings>(
+    builder.Configuration.GetSection(SuggestionSettings.SectionName));
+
+builder.Services.AddScoped<ISuggestionRepository, SuggestionRepository>();
+builder.Services.AddScoped<ISuggestionScorer, WeightedSuggestionScorer>();
+
+// Cache: NoOp by default (CacheSeconds == 0); swap to Redis by setting CacheSeconds > 0
+var suggestionCacheSeconds = builder.Configuration
+    .GetSection(SuggestionSettings.SectionName)
+    .GetValue<int>(nameof(SuggestionSettings.CacheSeconds));
+if (suggestionCacheSeconds > 0)
+    builder.Services.AddScoped<ISuggestionCache, RedisSuggestionCache>();
+else
+    builder.Services.AddScoped<ISuggestionCache, NoOpSuggestionCache>();
+
+builder.Services.AddScoped<ISuggestionService, SuggestionService>();
+
+// Follow module
+builder.Services.AddScoped<IFollowRepository, FollowRepository>();
+builder.Services.AddScoped<IFollowSuggestionScorer, WeightedFollowSuggestionScorer>();
+builder.Services.AddScoped<IFollowService, FollowService>();
+
+// Messaging module (M1)
+builder.Services.AddScoped<IConversationRepository, ConversationRepository>();
+builder.Services.AddScoped<IChatService, ChatService>();
+
+// Real-time chat (SignalR is part of the ASP.NET Core shared framework — no NuGet package).
+builder.Services.AddSignalR();
+// Target users by id across every device — never a hand-rolled connectionId map.
+builder.Services.AddSingleton<IUserIdProvider, ChatUserIdProvider>();
+// SignalR adapter for the IChatNotifier seam. Lives in Api (transport concern), not Infrastructure.
+builder.Services.AddScoped<IChatNotifier, SignalRChatNotifier>();
+
+// People directory module
+builder.Services.AddScoped<IPeopleRepository, PeopleRepository>();
+builder.Services.AddScoped<IPeopleService, PeopleService>();
 builder.Services.AddScoped<IAdminKycService, AdminKycService>();
 builder.Services.AddScoped<IAdminUserService, AdminUserService>();
 
@@ -137,6 +215,19 @@ builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
         // ⬇️ NAYA — SecurityStamp validation
         options.Events = new JwtBearerEvents
         {
+            // WebSocket handshakes can't send an Authorization header, so SignalR clients pass
+            // the JWT as ?access_token=. Lift it onto context.Token ONLY for /hubs paths — every
+            // other validation rule (key, issuer, audience, lifetime, SecurityStamp) still runs.
+            OnMessageReceived = context =>
+            {
+                var accessToken = context.Request.Query["access_token"];
+                var path = context.HttpContext.Request.Path;
+                if (!string.IsNullOrEmpty(accessToken) && path.StartsWithSegments("/hubs"))
+                    context.Token = accessToken;
+
+                return Task.CompletedTask;
+            },
+
             OnTokenValidated = async context =>
             {
                 // Get the SecurityStamp claim from token
@@ -193,15 +284,19 @@ builder.Services.AddAuthorization(options =>
     options.AddPolicy("IdentityVerified", policy =>
     policy.RequireClaim("identity_verified", "true"));
 
-    // Future policies (placeholders for next phases)
+    // LEGACY placeholders — these gate on primary_role (default experience), which is
+    // NOT a permission boundary. New work-action endpoints (apply, post job) must
+    // authorize via CAPABILITIES (profile completion), not these. Kept only so existing
+    // demo endpoints keep working after the claim rename (role → primary_role).
     options.AddPolicy("FreelancerOnly", policy =>
-        policy.RequireClaim("role", "Freelancer"));
+        policy.RequireClaim("primary_role", "Freelancer"));
 
     options.AddPolicy("ClientOnly", policy =>
-        policy.RequireClaim("role", "Client"));
+        policy.RequireClaim("primary_role", "Client"));
 
+    // AdminOnly is a genuine platform role (not freelancer/client) — claim-based authz here is fine.
     options.AddPolicy("AdminOnly", policy =>
-        policy.RequireClaim("role", "Admin"));
+        policy.RequireClaim("primary_role", "Admin"));
 });
 
 // FluentValidation registration
@@ -232,6 +327,10 @@ builder.Services.AddCors(options =>
         else if (builder.Environment.IsDevelopment())
         {
             // Dev-only fallback: local testing without origin config
+            // TODO: SignalR from a browser needs .AllowCredentials(), which is INCOMPATIBLE
+            // with .AllowAnyOrigin(). Before any web client or production deploy, replace this
+            // with a named-origin policy: .WithOrigins(<web origins>).AllowCredentials().
+            // The Flutter mobile client is unaffected (WebSocket, no CORS).
             policy.AllowAnyOrigin()
                   .AllowAnyMethod()
                   .AllowAnyHeader();
@@ -266,6 +365,19 @@ builder.Services.AddRateLimiter(options =>
                 Window = TimeSpan.FromMinutes(1),
                 QueueLimit = 0
             }));
+
+    // OTP endpoints (resend-otp, forgot-password) har call pe email bhejte hain —
+    // 10/min bohat loose tha (email bombing + SMTP quota burn). 3 per 5 min kaafi hai:
+    // legit user ek-do resend hi karta hai, attacker ruk jata hai.
+    options.AddPolicy("otp", httpContext =>
+        RateLimitPartition.GetFixedWindowLimiter(
+            partitionKey: httpContext.Connection.RemoteIpAddress?.ToString() ?? "unknown",
+            factory: _ => new FixedWindowRateLimiterOptions
+            {
+                PermitLimit = 3,
+                Window = TimeSpan.FromMinutes(5),
+                QueueLimit = 0
+            }));
 });
 
 var app = builder.Build();
@@ -280,7 +392,12 @@ if (app.Environment.IsDevelopment())
     app.UseSwaggerUI();
 }
 
-app.UseHttpsRedirection();
+// Dev mein off — phone http se aata hai (no trusted cert on phone)
+// Production mein on — https enforce hoga
+if (!app.Environment.IsDevelopment())
+{
+    app.UseHttpsRedirection();
+}
 
 // 1. Pehle Routing aayegi
 app.UseRouting();
@@ -298,5 +415,9 @@ app.UseAuthentication();
 app.UseAuthorization();
 
 app.MapControllers();
+
+// Chat hub — after authN/authZ so the [Authorize] hub sees the authenticated user.
+// JWT arrives via ?access_token= on the handshake (see OnMessageReceived above).
+app.MapHub<ChatHub>("/hubs/chat");
 
 app.Run();

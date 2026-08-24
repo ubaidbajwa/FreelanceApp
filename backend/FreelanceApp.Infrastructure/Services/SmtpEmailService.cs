@@ -35,7 +35,16 @@ public class SmtpEmailService : IEmailService
 
         message.Body = new BodyBuilder { HtmlBody = htmlBody }.ToMessageBody();
 
-        using var client = new SmtpClient();
+        using var client = new SmtpClient
+        {
+            // MailKit.Timeout only applies to synchronous socket reads/writes.
+            // Async calls (ConnectAsync, AuthenticateAsync, SendAsync) respect
+            // CancellationToken, not this property — so this alone does NOT bound
+            // async hangs. The real timeout is the CancellationToken passed into
+            // SendAsync by EmailBackgroundService (10s per email). This stays as
+            // a secondary guard for any sync-path fallback.
+            Timeout = 8000, // ms
+        };
 
         try
         {

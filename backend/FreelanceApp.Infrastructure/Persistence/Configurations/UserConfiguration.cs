@@ -1,4 +1,5 @@
 ﻿using FreelanceApp.Domain.Entities;
+using FreelanceApp.Domain.Enums;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Metadata.Builders;
 
@@ -24,9 +25,9 @@ public class UserConfiguration : IEntityTypeConfiguration<User>
             .IsUnique()
             .HasDatabaseName("IX_Users_Email");
 
-        // PasswordHash — BCrypt hashes are around 60 chars, give buffer
+        // PasswordHash — BCrypt hashes are around 60 chars, give buffer.
+        // NOT required: social-login users (Google/MS/Apple) have no password.
         builder.Property(u => u.PasswordHash)
-            .IsRequired()
             .HasMaxLength(255);
 
         // FullName
@@ -34,8 +35,17 @@ public class UserConfiguration : IEntityTypeConfiguration<User>
             .IsRequired()
             .HasMaxLength(100);
 
-        // Role: "Freelancer", "Client", "Admin"
-        builder.Property(u => u.Role)
+        // How the account was created. Stored as int; default Local (0).
+        builder.Property(u => u.Provider)
+            .IsRequired()
+            .HasDefaultValue(AuthProvider.Local);
+
+        // Provider's stable user id (e.g. Google "sub"). Null for Local accounts.
+        builder.Property(u => u.ExternalId)
+            .HasMaxLength(255);
+
+        // PrimaryRole: default experience only (not a permission boundary). Stored as int.
+        builder.Property(u => u.PrimaryRole)
             .IsRequired()
             .HasMaxLength(20);
 

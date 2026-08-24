@@ -26,10 +26,13 @@ public class JwtTokenService(IOptions<JwtSettings> jwtOptions) : IJwtTokenServic
                 DateTimeOffset.UtcNow.ToUnixTimeSeconds().ToString(),
                 ClaimValueTypes.Integer64),
 
-             new Claim("security_stamp", user.SecurityStamp.ToString()), 
+             new Claim("security_stamp", user.SecurityStamp.ToString()),
 
             // Custom claims (humare app ke liye unique)
-            new("role", user.Role.ToString()),
+            // primary_role = default experience only. IMPORTANT: future work-action
+            // endpoints (apply for a job, post a job) must authorize via CAPABILITIES
+            // (profile completion), NOT this claim — primary_role is not a permission boundary.
+            new("primary_role", user.PrimaryRole.ToString()),
             new("full_name", user.FullName),
             new("identity_verified", user.IsIdentityVerified.ToString().ToLower())
         };

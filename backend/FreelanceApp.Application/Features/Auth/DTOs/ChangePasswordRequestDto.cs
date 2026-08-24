@@ -7,8 +7,7 @@ public class ChangePasswordRequestDto
     [Required(ErrorMessage = "Current password is required")]
     public string CurrentPassword { get; set; } = string.Empty;
 
-    [Required(ErrorMessage = "New password is required")]
-    [MinLength(8, ErrorMessage = "Password must be at least 8 characters")]
-    [MaxLength(100, ErrorMessage = "Password too long")]
+    // NewPassword ki validation ChangePasswordRequestValidator (FluentValidation)
+    // mein hai — strong policy (upper/lower/digit/special) wahan apply hoti hai.
     public string NewPassword { get; set; } = string.Empty;
 }

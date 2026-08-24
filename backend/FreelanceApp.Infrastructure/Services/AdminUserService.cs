@@ -25,7 +25,7 @@ public class AdminUserService(
             Email = normalizedEmail,
             PasswordHash = passwordHasher.HashPassword(password),
             FullName = fullName.Trim(),
-            Role = UserRole.Admin,
+            PrimaryRole = UserRole.Admin,
             IsIdentityVerified = true,   // admins skip KYC
             IsEmailVerified = true,      // admins skip OTP verification
             SecurityStamp = Guid.NewGuid(),

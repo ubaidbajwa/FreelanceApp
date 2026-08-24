@@ -15,16 +15,34 @@ public class AuthController(IAuthService authService) : ControllerBase
     [HttpPost("register")]
     public async Task<IActionResult> Register([FromBody] RegisterRequestDto dto)
     {
+        // Email pehle se ho to service 409 Conflict throw karti hai —
+        // signup pe hi error dikhta hai, OTP tak intezar nahi.
         await authService.RegisterAsync(dto);
-        // Same response whether the account was created or the email already
-        // existed — prevents user enumeration.
-        return Ok(new { message = "Registration received. If the email is new, a verification code has been sent to it." });
+        return Ok(new { message = "Registration successful. A verification code has been sent to your email." });
+    }
+
+    [HttpPost("check-email")]
+    public async Task<IActionResult> CheckEmail([FromBody] CheckEmailRequestDto dto)
+    {
+        // Signup step 0 — "Agree & Join" pe instant duplicate check
+        var exists = await authService.EmailExistsAsync(dto.Email);
+        return Ok(new { exists });
     }
 
     [HttpPost("login")]
     public async Task<IActionResult> Login([FromBody] LoginRequestDto dto)
     {
         var result = await authService.LoginAsync(dto);
+        return Ok(result);
+    }
+
+    [HttpPost("google")]
+    public async Task<IActionResult> GoogleLogin([FromBody] GoogleLoginRequest dto, CancellationToken ct)
+    {
+        // Find-or-create: returning Google user logs in, an existing email gets
+        // linked, a new email creates a social account. A bad idToken surfaces
+        // as a 401 problem-details (verifier fails closed), never a 500.
+        var result = await authService.GoogleLoginAsync(dto, ct);
         return Ok(result);
     }
 
@@ -50,6 +68,7 @@ public class AuthController(IAuthService authService) : ControllerBase
     }
 
     [HttpPost("resend-otp")]
+    [EnableRateLimiting("otp")]   // stricter: 3 per 5 min — email bhejta hai
     public async Task<IActionResult> ResendOtp([FromBody] ResendOtpRequestDto dto)
     {
         await authService.ResendOtpAsync(dto);
@@ -57,6 +76,7 @@ public class AuthController(IAuthService authService) : ControllerBase
     }
 
     [HttpPost("forgot-password")]
+    [EnableRateLimiting("otp")]   // stricter: 3 per 5 min — email bhejta hai
     public async Task<IActionResult> ForgotPassword([FromBody] ForgotPasswordRequestDto dto)
     {
         await authService.ForgotPasswordAsync(dto);
