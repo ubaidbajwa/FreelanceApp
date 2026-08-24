@@ -1,0 +1,109 @@
+00:00 +0: loading C:/Users/ubaid/Desktop/flutter apps/FreelanceApp/freelancer_frontend/test/auth_interceptor_test.dart
+00:00 +0: C:/Users/ubaid/Desktop/flutter apps/FreelanceApp/freelancer_frontend/test/auth_interceptor_test.dart: 5 concurrent 401s trigger EXACTLY ONE refresh, then all retry OK
+00:00 +0 -1: loading C:/Users/ubaid/Desktop/flutter apps/FreelanceApp/freelancer_frontend/test/auth_interceptor_test.dart [E]
+  Error: Flutter failed to copy file from "C:\Users\ubaid\AppData\Local\Temp\flutter_tools.1fc315ca\flutter_test_compiler.959cc88d\output.dill" to "C:\Users\ubaid\AppData\Local\Temp\flutter_tools.1fc315ca\flutter_test_listener.cfc236df\listener.dart.dill". The target device is full.
+  FileSystemException: Cannot copy file to 'C:\Users\ubaid\AppData\Local\Temp\flutter_tools.1fc315ca\flutter_test_listener.cfc236df\listener.dart.dill', path = 'C:\Users\ubaid\AppData\Local\Temp\flutter_tools.1fc315ca\flutter_test_compiler.959cc88d\output.dill' (OS Error: There is not enough space on the disk, errno = 112)
+  Free up space and try again.
+  package:flutter_tools/src/base/common.dart 34:3               throwToolExit
+  package:flutter_tools/src/base/error_handling_io.dart 1451:3  _throwFileSystemException
+  package:flutter_tools/src/base/error_handling_io.dart 1441:3  _handleWindowsException
+  package:flutter_tools/src/base/error_handling_io.dart 1293:5  _onFileSystemException
+  package:flutter_tools/src/base/error_handling_io.dart 1072:7  _run
+  ===== asynchronous gap ===========================
+  package:flutter_tools/src/test/test_compiler.dart 261:41      TestCompiler._onCompilationRequest
+  
+00:00 +1 -1: C:/Users/ubaid/Desktop/flutter apps/FreelanceApp/freelancer_frontend/test/chat_notifier_test.dart: 1. successful load clears isLoading
+00:00 +2 -1: C:/Users/ubaid/Desktop/flutter apps/FreelanceApp/freelancer_frontend/test/chat_notifier_test.dart: 1. successful load clears isLoading
+[Chat] open(conv1) seq=1 cold=false — isLoading → true
+[Chat] getMessages start (seq=1)
+[Chat] getMessages done: 2 items (seq=1)
+[Chat] _loadMessages success (seq=1) — isLoading → false
+[Chat] open finally: seq=1 — isLoading already false
+00:00 +3 -1: C:/Users/ubaid/Desktop/flutter apps/FreelanceApp/freelancer_frontend/test/auth_interceptor_test.dart: invalid refresh token → tokens cleared + session marked expired
+00:00 +3 -1: C:/Users/ubaid/Desktop/flutter apps/FreelanceApp/freelancer_frontend/test/chat_notifier_test.dart: 2. failed load clears isLoading and exposes error
+[Chat] open(conv1) seq=1 cold=false — isLoading → true
+[Chat] getMessages start (seq=1)
+[Chat] _loadMessages error Exception: network error (seq=1) — isLoading → false
+[Chat] open finally: seq=1 — isLoading already false
+00:00 +4 -1: C:/Users/ubaid/Desktop/flutter apps/FreelanceApp/freelancer_frontend/test/auth_interceptor_test.dart: invalid refresh token → tokens cleared + session marked expired
+00:00 +4 -1: C:/Users/ubaid/Desktop/flutter apps/FreelanceApp/freelancer_frontend/test/chat_notifier_test.dart: 3. empty result clears isLoading (not a permanent spinner)
+[Chat] open(conv1) seq=1 cold=false — isLoading → true
+[Chat] getMessages start (seq=1)
+[Chat] getMessages done: 0 items (seq=1)
+[Chat] _loadMessages success (seq=1) — isLoading → false
+[Chat] open finally: seq=1 — isLoading already false
+00:00 +5 -1: C:/Users/ubaid/Desktop/flutter apps/FreelanceApp/freelancer_frontend/test/auth_interceptor_test.dart: invalid refresh token → tokens cleared + session marked expired
+00:00 +5 -1: C:/Users/ubaid/Desktop/flutter apps/FreelanceApp/freelancer_frontend/test/chat_notifier_test.dart: 4. stale-discarded response does not leave isLoading true
+[Chat] open(conv1) seq=1 cold=false — isLoading → true
+[Chat] getMessages start (seq=1)
+[Chat] open(conv1) seq=2 cold=false — isLoading → true
+[Chat] getMessages start (seq=2)
+[Chat] getMessages done: 1 items (seq=1)
+[Chat] STALE DISCARD in _loadMessages: mySeq=1, _seq=2 — data dropped, newer open finally owns isLoading
+[Chat] open finally: seq=1 superseded by seq=2 — newer open owns isLoading
+[Chat] getMessages done: 1 items (seq=2)
+[Chat] _loadMessages success (seq=2) — isLoading → false
+[Chat] open finally: seq=2 — isLoading already false
+00:00 +6 -1: C:/Users/ubaid/Desktop/flutter apps/FreelanceApp/freelancer_frontend/test/auth_interceptor_test.dart: invalid refresh token → tokens cleared + session marked expired
+00:00 +7 -1: C:/Users/ubaid/Desktop/flutter apps/FreelanceApp/freelancer_frontend/test/chat_notifier_test.dart: 5. reconnect refetch is blocked until initial load completes
+[Realtime] state → RealtimeConnectionState.connected  (connectCount=1)
+[Chat] open(conv1) seq=1 cold=false — isLoading → true
+[Chat] getMessages start (seq=1)
+[Realtime] state → RealtimeConnectionState.disconnected  (connectCount=1)
+[Realtime] state → RealtimeConnectionState.connected  (connectCount=2)
+[Chat] reconnect refetch scheduled (baseline=1, count=2)
+[Chat] reconnect refetch SKIPPED (initialLoadDone=false, conv="conv1")
+[Chat] getMessages done: 1 items (seq=1)
+[Chat] _loadMessages success (seq=1) — isLoading → false
+[Chat] open finally: seq=1 — isLoading already false
+[Realtime] state → RealtimeConnectionState.disconnected  (connectCount=2)
+[Realtime] state → RealtimeConnectionState.connected  (connectCount=3)
+[Chat] reconnect refetch scheduled (baseline=1, count=3)
+[Chat] reconnect refetch RUNNING (baseline=1, count=3, seq=1)
+00:00 +8 -1: C:/Users/ubaid/Desktop/flutter apps/FreelanceApp/freelancer_frontend/test/auth_interceptor_test.dart: no refresh token → immediate teardown, no refresh call
+00:00 +9 -1: C:/Users/ubaid/Desktop/flutter apps/FreelanceApp/freelancer_frontend/test/chat_notifier_test.dart: 6. opening a chat with connectCount already high does NOT refetch
+[Realtime] state → RealtimeConnectionState.disconnected  (connectCount=0)
+[Realtime] state → RealtimeConnectionState.connected  (connectCount=1)
+[Realtime] state → RealtimeConnectionState.disconnected  (connectCount=1)
+[Realtime] state → RealtimeConnectionState.connected  (connectCount=2)
+[Realtime] state → RealtimeConnectionState.disconnected  (connectCount=2)
+[Realtime] state → RealtimeConnectionState.connected  (connectCount=3)
+[Realtime] state → RealtimeConnectionState.disconnected  (connectCount=3)
+[Realtime] state → RealtimeConnectionState.connected  (connectCount=4)
+[Realtime] state → RealtimeConnectionState.disconnected  (connectCount=4)
+[Realtime] state → RealtimeConnectionState.connected  (connectCount=5)
+[Realtime] state → RealtimeConnectionState.disconnected  (connectCount=5)
+[Realtime] state → RealtimeConnectionState.connected  (connectCount=6)
+[Chat] open(conv1) seq=1 cold=false — isLoading → true
+[Chat] getMessages start (seq=1)
+[Chat] getMessages done: 1 items (seq=1)
+[Chat] _loadMessages success (seq=1) — isLoading → false
+[Chat] open finally: seq=1 — isLoading already false
+00:00 +10 -1: C:/Users/ubaid/Desktop/flutter apps/FreelanceApp/freelancer_frontend/test/chat_notifier_test.dart: 7. reconnect above the baseline after open DOES refetch
+[Realtime] state → RealtimeConnectionState.disconnected  (connectCount=0)
+[Realtime] state → RealtimeConnectionState.connected  (connectCount=1)
+[Realtime] state → RealtimeConnectionState.disconnected  (connectCount=1)
+[Realtime] state → RealtimeConnectionState.connected  (connectCount=2)
+[Realtime] state → RealtimeConnectionState.disconnected  (connectCount=2)
+[Realtime] state → RealtimeConnectionState.connected  (connectCount=3)
+[Realtime] state → RealtimeConnectionState.disconnected  (connectCount=3)
+[Realtime] state → RealtimeConnectionState.connected  (connectCount=4)
+[Realtime] state → RealtimeConnectionState.disconnected  (connectCount=4)
+[Realtime] state → RealtimeConnectionState.connected  (connectCount=5)
+[Realtime] state → RealtimeConnectionState.disconnected  (connectCount=5)
+[Realtime] state → RealtimeConnectionState.connected  (connectCount=6)
+[Chat] open(conv1) seq=1 cold=false — isLoading → true
+[Chat] getMessages start (seq=1)
+[Chat] getMessages done: 1 items (seq=1)
+[Chat] _loadMessages success (seq=1) — isLoading → false
+[Chat] open finally: seq=1 — isLoading already false
+[Realtime] state → RealtimeConnectionState.disconnected  (connectCount=6)
+[Realtime] state → RealtimeConnectionState.connected  (connectCount=7)
+[Chat] reconnect refetch scheduled (baseline=6, count=7)
+[Chat] reconnect refetch RUNNING (baseline=6, count=7, seq=1)
+00:00 +11 -1: C:/Users/ubaid/Desktop/flutter apps/FreelanceApp/freelancer_frontend/test/chat_screen_test.dart: ChatScreen: no build-phase provider mutation; spinner clears and messages render
+[Chat] open(conv1) seq=1 cold=false — isLoading → true
+[Chat] getMessages start (seq=1)
+[Chat] getMessages done: 1 items (seq=1)
+[Chat] _loadMessages success (seq=1) — isLoading → false
+[Chat] open finally: seq=1 — isLoading already false

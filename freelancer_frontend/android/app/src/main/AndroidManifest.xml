@@ -1,6 +1,7 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <application
-        android:label="freelancer_frontend"
+        android:usesCleartextTraffic="true"
+        android:label="Skillora"
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher">
         <activity

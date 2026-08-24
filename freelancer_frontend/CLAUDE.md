@@ -25,18 +25,19 @@ Style rules:
 - Buttons: navy fill, `StadiumBorder` pills or circles; gold never used as button fill
 - Thin gold borders (1.2px, ~45% alpha) instead of heavy colored containers
 - Cards: white, radius 16, subtle navy shadow (6% alpha)
-- Note: splash accent (cyan) differs from app accent (gold) — pending decision; prefer navy+gold for everything new. Setup screen still uses indigo `#3949AB` — needs migration to navy/gold.
+- Note: splash accent (cyan) differs from app accent (gold) — pending decision; prefer navy+gold for everything new.
 
 ## App Flow (built so far)
-`/splash` (3s, animated) → `/onboarding` (3 slides) → `/setup` (country + language on ONE screen)
+`/splash` (animated) → `/role-selection` (new user) or `/home` / `/profile-step1` (logged in)
 
-Next planned steps: role selection → phone verification (pre-filled dial code from selected country) → KYC (National ID vs Passport choice based on country).
+Removed (2026-07): 3-slide onboarding and `/setup` (country+language) screens — deleted along with their routes and country/language providers. Country/language constants in `core/constants/` are kept for future phone verification + KYC.
+
+Next planned steps: phone verification (dial code from country) → KYC (National ID vs Passport choice based on country).
 
 ## Key files
 - `lib/core/constants/country_config.dart` — ~195 countries: name, ISO, dialCode, optional `nationalId` (NationalIdDoc). Flag emoji auto-generated from ISO code. `kycDocuments` getter returns KYC doc choices (Passport always; National ID if country has one, e.g. PK=CNIC, IN=Aadhaar, AE=Emirates ID; US/GB/CA = passport only).
 - `lib/core/constants/languages.dart` — ~58 languages (name, nativeName, ISO 639-1 code), independent of country.
-- `lib/features/onboarding/providers/onboarding_providers.dart` — `selectedCountryProvider`, `selectedLanguageProvider` (global state; phone code + KYC flow read from these).
-- `lib/features/onboarding/presentation/screens/setup_screen.dart` — combined country+language picker: dropdown-style selector cards opening searchable bottom sheets (`_showSearchPicker<T>` generic helper — reuse it for any future pickers). Country search works by name, ISO code, and dial code.
+- `lib/features/onboarding/providers/onboarding_providers.dart` — `selectedRoleProvider` (role-selection + signup read this).
 
 ## Conventions
 - Screens live in `lib/features/<feature>/presentation/screens/`

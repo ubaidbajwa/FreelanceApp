@@ -13,7 +13,7 @@ class FreelanceApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp.router(
-      title: 'FreelanceApp',
+      title: 'Skillora',
       debugShowCheckedModeBanner: false, // corner wala DEBUG banner hatao
       theme: ThemeData(
         useMaterial3: true,

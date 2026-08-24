@@ -37,7 +37,7 @@ class RoleSelectionScreen extends ConsumerWidget {
               ),
               const SizedBox(height: 8),
               const Text(
-                'How will you use\nFreelanceApp?',
+                'How will you use\nSkillora?',
                 style: TextStyle(
                   color: _navy,
                   fontSize: 28,
@@ -125,7 +125,7 @@ class RoleSelectionScreen extends ConsumerWidget {
                   ),
                   onPressed: selectedRole == null
                       ? null // null = button disabled
-                      : () => context.go('/auth-placeholder'),
+                      : () => context.go('/signup'),
                   child: const Text('Continue',
                       style: TextStyle(fontSize: 16, letterSpacing: 1)),
                 ),

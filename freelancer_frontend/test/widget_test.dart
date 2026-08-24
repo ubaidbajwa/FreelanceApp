@@ -10,7 +10,7 @@ void main() {
     await tester.pumpWidget(const ProviderScope(child: FreelanceApp()));
 
     // Splash pe app ka naam dikhna chahiye
-    expect(find.text('FreelanceApp'), findsOneWidget);
+    expect(find.text('SKILLORA'), findsOneWidget);
 
     // Splash ka 2-second timer flush karo warna test fail hota hai
     // (pending timer + navigation to onboarding)

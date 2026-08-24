@@ -1,4 +1,4 @@
-package com.example.freelancer_frontend
+package com.skillora.app
 
 import io.flutter.embedding.android.FlutterActivity
 
