@@ -59,4 +59,8 @@ public class SignalRChatNotifier(IHubContext<ChatHub> hub) : IChatNotifier
         return hub.Clients.Users(ids).SendAsync("MessagePinChanged",
             new { conversationId, messageId, isPinned, pinExpiresAt }, ct);
     }
+
+    public Task ConversationReadAsync(Guid userId, Guid conversationId, DateTime lastReadAt, CancellationToken ct = default)
+        => hub.Clients.User(userId.ToString()).SendAsync("ConversationRead",
+            new { conversationId, lastReadAt }, ct);
 }

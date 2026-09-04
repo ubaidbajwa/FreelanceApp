@@ -121,6 +121,8 @@ builder.Services.AddSingleton<IFaceMatchService, AwsRekognitionFaceMatchService>
 
 // Image Storage Service
 builder.Services.AddScoped<IImageStorageService, CloudinaryImageService>();
+// Chat media (image/video with full metadata) — SAME Cloudinary service, second interface, one integration.
+builder.Services.AddScoped<IMediaStorageService, CloudinaryImageService>();
 
 builder.Services.AddScoped<IKycRepository, KycRepository>();
 builder.Services.AddScoped<IKycService, KycService>();

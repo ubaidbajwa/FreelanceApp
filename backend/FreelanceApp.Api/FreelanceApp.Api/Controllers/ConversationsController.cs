@@ -1,5 +1,7 @@
+using FreelanceApp.Api.Models;
 using FreelanceApp.Application.Features.Messaging.DTOs;
 using FreelanceApp.Application.Features.Messaging.Services;
+using FreelanceApp.Application.Interfaces.Services;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 
@@ -74,6 +76,38 @@ public class ConversationsController(IChatService chatService) : ControllerBase
         Guid id, [FromBody] SendMessageRequestDto dto, CancellationToken ct)
     {
         var message = await chatService.SendMessageAsync(id, dto, ct);
+        return Created(string.Empty, message);   // 201
+    }
+
+    // Send an image/video in ONE request (multipart). The file is uploaded to Cloudinary and the
+    // message created in the same request, so a file only exists if a message exists. RequestSizeLimit
+    // lifts Kestrel's default 30 MB cap to the 50 MB video limit; ChatService enforces the real per-kind
+    // limits (10 MB image / 50 MB video), the allowed types, magic bytes, and the 120 s video duration.
+    [HttpPost("{id:guid}/messages/media")]
+    [RequestSizeLimit(52_428_800)]                                    // 50 MB
+    [RequestFormLimits(MultipartBodyLengthLimit = 52_428_800)]       // 50 MB
+    public async Task<IActionResult> SendMediaMessage(
+        Guid id, [FromForm] SendMediaMessageApiRequest apiRequest, CancellationToken ct)
+    {
+        var file = apiRequest.File;
+        if (file is null || file.Length == 0)
+            throw new Application.Exceptions.ValidationException("A media file is required.");
+
+        var input = new MediaUploadInput
+        {
+            Content = file.OpenReadStream(),
+            FileName = file.FileName,
+            ContentType = file.ContentType ?? string.Empty,
+            Length = file.Length
+        };
+        var request = new SendMediaMessageRequestDto
+        {
+            Caption = apiRequest.Caption,
+            ReplyToMessageId = apiRequest.ReplyToMessageId,
+            Waveform = apiRequest.Waveform
+        };
+
+        var message = await chatService.SendMediaMessageAsync(id, request, input, ct);
         return Created(string.Empty, message);   // 201
     }
 
