@@ -4,6 +4,15 @@
 <dict>
 	<key>CADisableMinimumFrameDurationOnPhone</key>
 	<true/>
+	<!-- F-M5 media messaging (image_picker). Missing usage strings are an immediate
+	     App Store rejection, so all three are declared: camera for capture, photo
+	     library for gallery pick, and microphone for the audio track of a recorded video. -->
+	<key>NSCameraUsageDescription</key>
+	<string>Skillora needs camera access so you can take photos and videos to send in your chats.</string>
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>Skillora needs photo library access so you can share photos and videos in your chats.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Skillora needs microphone access to record audio when you capture a video to send.</string>
 	<key>CFBundleDevelopmentRegion</key>
 	<string>$(DEVELOPMENT_LANGUAGE)</string>
 	<key>CFBundleDisplayName</key>

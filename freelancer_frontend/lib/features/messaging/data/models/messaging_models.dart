@@ -30,13 +30,15 @@ enum MessageType {
   image, // 1
   file, // 2
   voice, // 3
-  system; // 4 — pin/unpin system notice (body empty; client builds the text)
+  system, // 4 — pin/unpin system notice (body empty; client builds the text)
+  video; // 5 — F-M5 video message (body carries the optional caption)
 
   static MessageType fromApi(int value) => switch (value) {
         1 => MessageType.image,
         2 => MessageType.file,
         3 => MessageType.voice,
         4 => MessageType.system,
+        5 => MessageType.video,
         _ => MessageType.text,
       };
 }
@@ -96,8 +98,18 @@ class ConversationSummary {
   final bool isRequest; // incoming pending request hai (backend ne derive kiya)
   final ConversationUser otherUser;
   final String? lastMessagePreview; // ≤120 chars; koi message nahi to null
+  // F-M5 — last content message ka type (null jab koi message nahi). Uncaptioned
+  // media ke liye client localised "Photo"/"Video" render karta hai (server label
+  // deliberately nahi bhejta — dekho resolveConversationPreview).
+  final MessageType? lastMessageType;
   final DateTime? lastMessageAt; // UTC; render pe .toLocal()
   final int unreadCount;
+
+  // M4 — DOOSRE participant ka read watermark, caller ke perspective se (UTC).
+  // null = unhon ne kabhi kuch nahi padha. Sender apne bheje messages pe read tick
+  // isi se decide karta hai: message read jab createdAt <= otherLastReadAt (UTC).
+  // Ek watermark per conversation — ek saath saare bubbles update hote hain.
+  final DateTime? otherLastReadAt;
 
   const ConversationSummary({
     required this.id,
@@ -105,8 +117,10 @@ class ConversationSummary {
     required this.isRequest,
     required this.otherUser,
     this.lastMessagePreview,
+    this.lastMessageType,
     this.lastMessageAt,
     this.unreadCount = 0,
+    this.otherLastReadAt,
   });
 
   factory ConversationSummary.fromJson(Map<String, dynamic> json) =>
@@ -117,10 +131,18 @@ class ConversationSummary {
         otherUser:
             ConversationUser.fromJson(json['otherUser'] as Map<String, dynamic>),
         lastMessagePreview: json['lastMessagePreview'] as String?,
+        // int? in (missing/null → null). fromApi khud int? handle nahi karta, is
+        // liye null-check pehle karte hain (koi bhi type=0 ko text mante hain).
+        lastMessageType: json['lastMessageType'] == null
+            ? null
+            : MessageType.fromApi(json['lastMessageType'] as int),
         lastMessageAt: json['lastMessageAt'] == null
             ? null
             : DateTime.parse(json['lastMessageAt'] as String),
         unreadCount: json['unreadCount'] as int? ?? 0,
+        otherLastReadAt: json['otherLastReadAt'] == null
+            ? null
+            : DateTime.parse(json['otherLastReadAt'] as String),
       );
 }
 
@@ -208,6 +230,21 @@ class Message {
   // (Tap-to-jump out of scope — sirf carry karte hain; dekho docs/TODO.md.)
   final String? systemTargetMessageId;
 
+  // ===== Media fields (F-M5, additive, nullable) — sirf Image/Video pe set =====
+  // Body caption carry karta hai. MediaPublicId server-only deletion handle hai —
+  // wire pe kabhi nahi aata. Width/Height se bubble apni jagah image load hone se
+  // PEHLE reserve karta hai (koi layout jump nahi). Tombstone (isDeleted) pe server
+  // mediaUrl + mediaThumbnailUrl blank kar deta hai (body ki tarah).
+  final String? mediaUrl; // full asset — SIRF full-screen viewer mein
+  final String? mediaThumbnailUrl; // bubble thumbnail (mediaUrl kabhi bubble mein nahi)
+  final int? mediaWidth;
+  final int? mediaHeight;
+  final int? mediaDurationMs; // video length (m:ss render); image pe null
+  final String? mediaMimeType;
+  // F-M11 voice — comma-separated amplitude samples (0–100, ≤64), client-computed.
+  // null = koi samples nahi → bubble flat bar dikhata hai. Voice pe hi set hota.
+  final String? mediaWaveform;
+
   const Message({
     required this.id,
     required this.conversationId,
@@ -225,6 +262,13 @@ class Message {
     this.pinExpiresAt,
     this.systemEventType,
     this.systemTargetMessageId,
+    this.mediaUrl,
+    this.mediaThumbnailUrl,
+    this.mediaWidth,
+    this.mediaHeight,
+    this.mediaDurationMs,
+    this.mediaMimeType,
+    this.mediaWaveform,
   });
 
   factory Message.fromJson(Map<String, dynamic> json) => Message(
@@ -254,6 +298,13 @@ class Message {
         systemEventType:
             SystemEventType.fromApi(json['systemEventType'] as int?),
         systemTargetMessageId: json['systemTargetMessageId'] as String?,
+        mediaUrl: json['mediaUrl'] as String?,
+        mediaThumbnailUrl: json['mediaThumbnailUrl'] as String?,
+        mediaWidth: json['mediaWidth'] as int?,
+        mediaHeight: json['mediaHeight'] as int?,
+        mediaDurationMs: json['mediaDurationMs'] as int?,
+        mediaMimeType: json['mediaMimeType'] as String?,
+        mediaWaveform: json['mediaWaveform'] as String?,
       );
 }
 

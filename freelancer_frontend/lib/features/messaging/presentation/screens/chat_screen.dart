@@ -1,9 +1,11 @@
-﻿// Real chat screen (F-M2) — REST-only, no real-time (F-M3 add karega). Naye
+// Real chat screen (F-M2) — REST-only, no real-time (F-M3 add karega). Naye
 // messages sirf open/refresh pe aate hain. chat_screen_placeholder.dart ki jagah.
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
+import 'package:image_picker/image_picker.dart';
+import 'package:app_settings/app_settings.dart';
 
 import '../../../../core/error/error_mapper.dart';
 import '../../../../core/presentation/widgets/user_avatar.dart';
@@ -11,17 +13,19 @@ import '../../../../core/utils/number_format.dart';
 import '../../../../core/utils/relative_time.dart';
 import '../../application/active_conversation_provider.dart';
 import 'forward_picker_screen.dart';
+import 'media_preview_screen.dart';
+import 'media_viewer_screen.dart';
+import '../widgets/media_bubble_content.dart';
+import '../widgets/voice_bubble.dart';
 import '../../application/chat_notifier.dart';
+import '../../application/voice_recording_notifier.dart';
+import '../../application/voice_playback_notifier.dart';
 import '../../application/message_actions.dart';
 import '../../data/models/messaging_models.dart';
 import '../../messaging_strings.dart';
 
 class ChatScreen extends ConsumerStatefulWidget {
-  const ChatScreen({
-    super.key,
-    required this.conversationId,
-    this.summary,
-  });
+  const ChatScreen({super.key, required this.conversationId, this.summary});
 
   final String conversationId;
   // F-M1 nav contract se aati hai (status/isRequest/otherUser). Cold deep-link /
@@ -32,7 +36,8 @@ class ChatScreen extends ConsumerStatefulWidget {
   ConsumerState<ChatScreen> createState() => _ChatScreenState();
 }
 
-class _ChatScreenState extends ConsumerState<ChatScreen> {
+class _ChatScreenState extends ConsumerState<ChatScreen>
+    with WidgetsBindingObserver {
   static const _ivory = Color(0xFFFAFAF8);
   static const _navy = Color(0xFF0A1633);
   static const _gold = Color(0xFFC0A062);
@@ -40,12 +45,22 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
   // Autoscroll on fan-out: only if user is within this many pixels of the bottom.
   static const _autoscrollThreshold = 150.0;
 
+  // F-M11: live drag offset of the mic press-and-hold (from origin), plus whether
+  // this gesture has already locked. Drives the slide-to-cancel hint + lock fill.
+  Offset _holdOffset = Offset.zero;
+  bool _holdLocked = false;
+  RecordDragOutcome _holdOutcome = RecordDragOutcome.none;
+
   final _scroll = ScrollController();
   final _input = TextEditingController();
   final _focus = FocusNode();
 
   // F-M5: tap-to-jump highlight (briefly tints the target bubble gold).
   String? _highlightedMessageId;
+  // F-M7: floating reaction bar overlay, anchored above the long-pressed bubble.
+  OverlayEntry? _reactionBar;
+  String?
+  _reactionBarMessageId; // which message the bar is currently anchored to
   // F-M6: composer content saved when entering edit mode, restored on cancel.
   String? _preEditInput;
   // GlobalKey per message so Scrollable.ensureVisible can locate any loaded bubble.
@@ -59,6 +74,9 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
   void initState() {
     super.initState();
     _activeConv = ref.read(activeConversationProvider.notifier);
+    WidgetsBinding.instance.addObserver(
+      this,
+    ); // F-M11: background → stop record/play
     _scroll.addListener(_onScroll);
     // DEFERRED past the first frame — open() synchronously mutates providers
     // (setActive on activeConversationProvider + seeding chatProvider state).
@@ -68,15 +86,28 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
     // build() renders isLoading until open() runs one frame later.
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
-      ref.read(chatProvider.notifier).open(
-            conversationId: widget.conversationId,
-            summary: widget.summary,
-          );
+      ref
+          .read(chatProvider.notifier)
+          .open(conversationId: widget.conversationId, summary: widget.summary);
     });
+  }
+
+  // F-M11: leaving the foreground stops recording (never record in background) and
+  // stops any playback. Both notifiers keep what was already captured.
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.paused ||
+        state == AppLifecycleState.inactive ||
+        state == AppLifecycleState.hidden) {
+      ref.read(voiceRecordingProvider.notifier).onAppBackgrounded();
+      ref.read(voicePlaybackProvider.notifier).stopForBackground();
+    }
   }
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _removeReactionBar(); // F-M7: never leak the overlay entry
     _scroll.dispose();
     _input.dispose();
     _focus.dispose();
@@ -139,24 +170,202 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
     );
   }
 
+  // ── F-M5: attachments ─────────────────────────────────────────────────────────
+
+  // Composer attachment button → sheet with exactly two options: Gallery and
+  // Camera. Documents is deliberately absent this slice (an option that does
+  // nothing is a false affordance — same reason the call icons were left out).
+  void _openAttachmentSheet() {
+    _focus.unfocus();
+    showModalBottomSheet<void>(
+      context: context,
+      backgroundColor: _ivory,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
+      ),
+      builder: (sheetCtx) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Container(
+              margin: const EdgeInsets.only(top: 12, bottom: 4),
+              width: 40,
+              height: 4,
+              decoration: BoxDecoration(
+                color: _navy.withValues(alpha: 0.15),
+                borderRadius: BorderRadius.circular(2),
+              ),
+            ),
+            ListTile(
+              leading: const Icon(Icons.photo_library_outlined, color: _navy),
+              title: const Text(
+                MessagingStrings.attachGallery,
+                style: TextStyle(color: _navy, fontWeight: FontWeight.w600),
+              ),
+              onTap: () {
+                Navigator.pop(sheetCtx);
+                _pickFromGallery();
+              },
+            ),
+            ListTile(
+              leading: const Icon(Icons.camera_alt_outlined, color: _navy),
+              title: const Text(
+                MessagingStrings.attachCamera,
+                style: TextStyle(color: _navy, fontWeight: FontWeight.w600),
+              ),
+              onTap: () {
+                Navigator.pop(sheetCtx);
+                _pickFromCamera();
+              },
+            ),
+            const SizedBox(height: 8),
+          ],
+        ),
+      ),
+    );
+  }
+
+  // Gallery: single image OR video (pickMedia). Multi-select noted in docs/TODO.md.
+  Future<void> _pickFromGallery() async {
+    try {
+      final picked = await ImagePicker().pickMedia();
+      await _onPicked(picked);
+    } on PlatformException catch (e) {
+      _onPickPermissionError(e, isCamera: false);
+    }
+  }
+
+  // Camera: capture a photo with the built-in camera (image_picker). The full
+  // WhatsApp-style camera — including video capture — is F-M11; this entry point
+  // exists so the flow works end to end now (see docs/TODO.md).
+  Future<void> _pickFromCamera() async {
+    try {
+      final picked = await ImagePicker().pickImage(source: ImageSource.camera);
+      await _onPicked(picked);
+    } on PlatformException catch (e) {
+      _onPickPermissionError(e, isCamera: true);
+    }
+  }
+
+  // Cancelled pick (user backed out) is normal — do nothing, no error state.
+  // Otherwise validate size/type client-side BEFORE any upload, then push preview.
+  Future<void> _onPicked(XFile? picked) async {
+    if (picked == null || !mounted) return; // cancelled — not an error
+    final kind = mediaKindForPath(picked.path);
+    if (kind == null) {
+      _snack(MessagingStrings.mediaUnsupportedType);
+      return;
+    }
+    final length = await picked.length();
+    final err = validateMediaFile(path: picked.path, lengthBytes: length);
+    if (err != null) {
+      _snack(err);
+      return;
+    }
+    if (!mounted) return;
+    await Navigator.of(context).push<void>(
+      MaterialPageRoute<void>(
+        builder: (_) => MediaPreviewScreen(path: picked.path, kind: kind),
+      ),
+    );
+  }
+
+  // Denied permission is not a silent dead button — explain what's needed and offer
+  // a route to the system settings. image_picker throws with an access-denied code
+  // when the user has denied camera/photo access.
+  void _onPickPermissionError(PlatformException e, {required bool isCamera}) {
+    final denied =
+        e.code.contains('access') ||
+        e.code.contains('denied') ||
+        e.code == 'photo_access_denied' ||
+        e.code == 'camera_access_denied';
+    if (denied) {
+      _showPermissionDialog(isCamera: isCamera);
+    } else {
+      _snack(MessagingStrings.genericError);
+    }
+  }
+
+  Future<void> _showPermissionDialog({required bool isCamera}) async {
+    if (!mounted) return;
+    await showDialog<void>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: Colors.white,
+        title: Text(
+          isCamera
+              ? MessagingStrings.permissionCameraTitle
+              : MessagingStrings.permissionPhotosTitle,
+          style: const TextStyle(
+            fontSize: 17,
+            fontWeight: FontWeight.w700,
+            color: _navy,
+          ),
+        ),
+        content: Text(
+          isCamera
+              ? MessagingStrings.permissionCameraBody
+              : MessagingStrings.permissionPhotosBody,
+          textAlign: TextAlign.start,
+          style: TextStyle(fontSize: 14, color: _navy.withValues(alpha: 0.6)),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            style: TextButton.styleFrom(
+              foregroundColor: _navy.withValues(alpha: 0.55),
+            ),
+            child: const Text(MessagingStrings.permissionDismiss),
+          ),
+          FilledButton(
+            onPressed: () {
+              Navigator.pop(ctx);
+              AppSettings.openAppSettings();
+            },
+            style: FilledButton.styleFrom(
+              backgroundColor: _navy,
+              foregroundColor: Colors.white,
+              shape: const StadiumBorder(),
+            ),
+            child: const Text(MessagingStrings.permissionOpenSettings),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // Open the full-screen viewer for a confirmed media message.
+  void _openViewer(ChatMessage m) {
+    final url = m.mediaUrl;
+    if (url == null || url.isEmpty) return;
+    final senderName = m.isMine
+        ? MessagingStrings.replyYou
+        : (ref.read(chatProvider).otherUser?.fullName ??
+              widget.summary?.otherUser.fullName ??
+              '');
+    Navigator.of(context).push<void>(
+      MaterialPageRoute<void>(
+        builder: (_) => MediaViewerScreen(
+          mediaUrl: url,
+          type: m.type,
+          senderName: senderName,
+          createdAt: m.createdAt,
+          mediaDurationMs: m.mediaDurationMs,
+        ),
+      ),
+    );
+  }
+
   // F-M5: toolbar reply tap → draft set → selection cleared → composer focused.
   void _replyToSelected() {
     final notifier = ref.read(chatProvider.notifier);
-    final selected = notifier.selectedMessages;
-    if (selected.length != 1) return;
-    notifier.setDraftReply(selected.first);
-    notifier.clearSelection();
-    _focus.requestFocus();
+    if (notifier.replySelected()) _focus.requestFocus();
   }
 
   // F-M6: toolbar "Edit" tap → enter edit mode; screen populates composer via listener.
   void _startEditSelected() {
     final notifier = ref.read(chatProvider.notifier);
-    final selected = notifier.selectedMessages;
-    if (selected.length != 1) return;
-    notifier.startEdit(selected.first);
-    notifier.clearSelection();
-    _focus.requestFocus();
+    if (notifier.startEditSelected()) _focus.requestFocus();
   }
 
   // F-M6: cancel edit — restore pre-edit composer content.
@@ -164,14 +373,166 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
     ref.read(chatProvider.notifier).cancelEdit();
     _input.text = _preEditInput ?? '';
     _input.selection = TextSelection.fromPosition(
-      TextPosition(offset: _input.text.length));
+      TextPosition(offset: _input.text.length),
+    );
     _preEditInput = null;
   }
 
-  // F-M6: forward — push the conversation picker; on return clear selection + snack.
+  // ── F-M7: reactions ─────────────────────────────────────────────────────────
+
+  // Apply a reaction (optimistic in the notifier) and dismiss the bar. Clearing
+  // the selection hides the bar via _syncReactionBar; the toggle then runs and
+  // only surfaces a snackbar if the round trip fails (after rolling back).
+  Future<void> _react(String messageId, String emoji) async {
+    final notifier = ref.read(chatProvider.notifier);
+    notifier.clearSelection();
+    final err = await notifier.toggleReaction(messageId, emoji);
+    if (!mounted) return;
+    if (err != null) _snack(err);
+  }
+
+  // The "+" on the bar → full curated picker in a bottom sheet. Selecting applies
+  // and closes; there is no search box or skin-tone selector this slice (TODO.md).
+  Future<void> _openReactionPicker(String messageId) async {
+    ref.read(chatProvider.notifier).clearSelection(); // hide the bar first
+    final emoji = await showModalBottomSheet<String>(
+      context: context,
+      backgroundColor: Colors.white,
+      isScrollControlled: true,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      builder: (_) => const _EmojiPickerSheet(),
+    );
+    if (emoji == null || !mounted) return;
+    final err = await ref
+        .read(chatProvider.notifier)
+        .toggleReaction(messageId, emoji);
+    if (!mounted) return;
+    if (err != null) _snack(err);
+  }
+
+  // Insert / move / remove the reaction bar to match the current selection. Shown
+  // only for a single reactable selection (shouldShowReactionBar); a second
+  // selection, clear, back, or an applied reaction all remove it.
+  void _syncReactionBar() {
+    if (!mounted) return;
+    final state = ref.read(chatProvider);
+    final selected = ref.read(chatProvider.notifier).selectedMessages;
+    final show = state.reactionBarVisible && shouldShowReactionBar(selected);
+    final id = show ? selected.first.id : null;
+    if (id == null) {
+      _removeReactionBar();
+      return;
+    }
+    if (_reactionBarMessageId == id && _reactionBar != null) {
+      if (mounted) _reactionBar!.markNeedsBuild();
+      return;
+    }
+    _removeReactionBar();
+    _reactionBarMessageId = id;
+    // Capture the notifier + the caller's current emoji up front. The bar is only
+    // open for a single, fixed selection and myReactionEmoji cannot change while it
+    // shows (reacting clears the selection), so a snapshot is safe — and it keeps
+    // live `ref`/state reads OUT of the OverlayEntry builder, which can outlive
+    // this State.
+    final notifier = ref.read(chatProvider.notifier);
+    final myEmoji = _currentMyEmoji(id);
+    final entry = OverlayEntry(
+      builder: (_) => _reactionBarOverlay(id, myEmoji, notifier),
+    );
+    _reactionBar = entry;
+    Overlay.of(context, rootOverlay: true).insert(entry);
+  }
+
+  void _removeReactionBar() {
+    _reactionBar?.remove();
+    _reactionBar = null;
+    _reactionBarMessageId = null;
+  }
+
+  // Positions the bar ABOVE the anchored bubble, flipping BELOW when the bubble is
+  // too near the top of the viewport, and clamping horizontally so a bar centred
+  // over an edge-hugging bubble never runs off-screen.
+  Widget _reactionBarOverlay(
+    String messageId,
+    String? myEmoji,
+    ChatNotifier notifier,
+  ) {
+    // The entry can be rebuilt by the Overlay scheduler; if this State is gone,
+    // touching its context/ref would throw — bail to an empty box instead.
+    if (!mounted) return const SizedBox.shrink();
+    final anchorCtx = _bubbleKeys[messageId]?.currentContext;
+    final overlayBox =
+        Overlay.of(context, rootOverlay: true).context.findRenderObject()
+            as RenderBox?;
+    if (anchorCtx == null || overlayBox == null) return const SizedBox.shrink();
+    final box = anchorCtx.findRenderObject() as RenderBox?;
+    if (box == null || !box.hasSize) return const SizedBox.shrink();
+
+    final topLeft = box.localToGlobal(Offset.zero, ancestor: overlayBox);
+    final bubbleSize = box.size;
+    final screen = overlayBox.size;
+
+    const barHeight = 52.0;
+    const barWidth = 300.0; // fixed → exact horizontal clamp
+    const gap = 8.0;
+    // Keep the bar (and the dismiss catcher) clear of the app bar so the selection
+    // toolbar — delete / copy / forward / pin — stays tappable while the bar shows.
+    final appBarBottom = MediaQuery.paddingOf(context).top + kToolbarHeight;
+    final safeTop = appBarBottom + 8.0;
+
+    // Prefer above; flip below when there isn't room above.
+    var top = topLeft.dy - barHeight - gap;
+    if (top < safeTop) top = topLeft.dy + bubbleSize.height + gap;
+
+    // Centre over the bubble, then clamp so [8, screenWidth-barWidth-8].
+    final centreX = topLeft.dx + bubbleSize.width / 2;
+    final upper = (screen.width - barWidth - 8.0);
+    final left = (centreX - barWidth / 2).clamp(8.0, upper < 8.0 ? 8.0 : upper);
+
+    return Stack(
+      children: [
+        // Tapping the message area (below the app bar) dismisses the bar. The app
+        // bar itself is intentionally left uncovered so its selection toolbar keeps
+        // working — covering it would eat the delete/copy taps.
+        Positioned(
+          top: appBarBottom,
+          left: 0,
+          right: 0,
+          bottom: 0,
+          child: GestureDetector(
+            behavior: HitTestBehavior.translucent,
+            onTap: notifier.clearSelection,
+          ),
+        ),
+        Positioned(
+          left: left,
+          top: top,
+          width: barWidth,
+          child: _ReactionBar(
+            myEmoji: myEmoji,
+            onSelect: (emoji) => _react(messageId, emoji),
+            onMore: () => _openReactionPicker(messageId),
+          ),
+        ),
+      ],
+    );
+  }
+
+  String? _currentMyEmoji(String messageId) {
+    for (final m in ref.read(chatProvider).messages) {
+      if (m.id == messageId) return m.myReactionEmoji;
+    }
+    return null;
+  }
+
+  // F-M6: forward — push the conversation picker; on return show snack if sent.
+  // clearSelection() fires BEFORE navigation so the bar dismisses on ALL exit paths
+  // (send, cancel, swipe-back). IDs are snapshotted first so the push still works.
   void _forwardSelected() async {
     final notifier = ref.read(chatProvider.notifier);
-    final ids = notifier.selectedMessages.map((m) => m.id).toList();
+    final ids = notifier.forwardSelectedMessageIds();
     if (ids.isEmpty) return;
     final result = await Navigator.of(context).push<bool>(
       MaterialPageRoute<bool>(
@@ -181,9 +542,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
         ),
       ),
     );
-    if (result == true) {
-      notifier.clearSelection();
-      if (!mounted) return;
+    if (result == true && mounted) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text(MessagingStrings.forwardSuccess)),
       );
@@ -241,50 +600,110 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
 
     // textToRestore: 403 sendMessage ke baad refetch ne State A confirm kiya —
     // typed text wapas composer mein aata hai. Screen reads state, restores, clears.
-    ref.listen<String?>(
-      chatProvider.select((s) => s.textToRestore),
-      (_, next) {
-        if (next != null) {
-          _input.text = next;
-          _input.selection = TextSelection.fromPosition(
-            TextPosition(offset: _input.text.length),
-          );
-          ref.read(chatProvider.notifier).clearTextRestore();
-        }
-      },
-    );
+    ref.listen<String?>(chatProvider.select((s) => s.textToRestore), (_, next) {
+      if (next != null) {
+        _input.text = next;
+        _input.selection = TextSelection.fromPosition(
+          TextPosition(offset: _input.text.length),
+        );
+        ref.read(chatProvider.notifier).clearTextRestore();
+      }
+    });
 
     // Fan-out autoscroll: scroll to newest only if user is already near the bottom.
     // Reverse list → offset 0 = newest (bottom of screen). If user scrolled up
     // (large offset), don't interrupt them.
-    ref.listen<bool>(
-      chatProvider.select((s) => s.scrollToLatest),
-      (_, shouldScroll) {
-        if (!shouldScroll) return;
-        ref.read(chatProvider.notifier).clearScrollSignal();
-        if (_scroll.hasClients && _scroll.offset < _autoscrollThreshold) {
-          _scroll.animateTo(
-            0,
-            duration: const Duration(milliseconds: 250),
-            curve: Curves.easeOut,
+    ref.listen<bool>(chatProvider.select((s) => s.scrollToLatest), (
+      _,
+      shouldScroll,
+    ) {
+      if (!shouldScroll) return;
+      ref.read(chatProvider.notifier).clearScrollSignal();
+      if (_scroll.hasClients && _scroll.offset < _autoscrollThreshold) {
+        _scroll.animateTo(
+          0,
+          duration: const Duration(milliseconds: 250),
+          curve: Curves.easeOut,
+        );
+      }
+    });
+
+    // F-M6: entering edit mode — populate composer with the original body.
+    ref.listen<EditDraft?>(chatProvider.select((s) => s.draftEdit), (
+      prev,
+      next,
+    ) {
+      if (next != null && prev == null) {
+        _preEditInput = _input.text;
+        _input.text = next.originalBody;
+        _input.selection = TextSelection.fromPosition(
+          TextPosition(offset: _input.text.length),
+        );
+        _focus.requestFocus();
+      }
+    });
+
+    // F-M7: selection + explicit visibility drive the floating reaction bar. Pin
+    // cap keeps selection for retry but flips visibility off; normal actions clear
+    // selection and visibility together through ChatNotifier.
+    ref.listen<(Set<String>, bool)>(
+      chatProvider.select((s) => (s.selectedMessageIds, s.reactionBarVisible)),
+      (_, next) {
+        if (next.$1.isEmpty || !next.$2) {
+          _removeReactionBar();
+        } else {
+          WidgetsBinding.instance.addPostFrameCallback(
+            (_) => _syncReactionBar(),
           );
         }
       },
     );
 
-    // F-M6: entering edit mode — populate composer with the original body.
-    ref.listen<EditDraft?>(
-      chatProvider.select((s) => s.draftEdit),
-      (prev, next) {
-        if (next != null && prev == null) {
-          _preEditInput = _input.text;
-          _input.text = next.originalBody;
-          _input.selection = TextSelection.fromPosition(
-            TextPosition(offset: _input.text.length));
-          _focus.requestFocus();
-        }
+    // F-M5: a media send failed for a reason the user must see once (e.g. the
+    // server's "video too long" 400). The failed bubble already offers retry; this
+    // surfaces the specific message, then clears it so it fires only once.
+    ref.listen<String?>(chatProvider.select((s) => s.sendError), (_, next) {
+      if (next != null) {
+        _snack(next);
+        ref.read(chatProvider.notifier).clearSendError();
+      }
+    });
+
+    // F-M11: a finished recording is ready → send it via the shared media path
+    // (optimistic bubble, progress, retry-keeps-file). Auto-stop at 300 s lands here
+    // too. Consume so it fires once.
+    ref.listen<VoiceResult?>(
+      voiceRecordingProvider.select((s) => s.completed),
+      (_, result) {
+        if (result == null) return;
+        ref
+            .read(chatProvider.notifier)
+            .sendVoice(
+              path: result.path,
+              durationMs: result.durationMs,
+              waveform: result.waveform,
+            );
+        ref.read(voiceRecordingProvider.notifier).consumeCompleted();
       },
     );
+    // Mic taken by another app / call → explain, don't crash.
+    ref.listen<String?>(voiceRecordingProvider.select((s) => s.error), (
+      _,
+      err,
+    ) {
+      if (err == null) return;
+      _snack(err);
+      ref.read(voiceRecordingProvider.notifier).consumeError();
+    });
+    // Released under 1 s → accidental-tap hint.
+    ref.listen<bool>(voiceRecordingProvider.select((s) => s.tooShort), (
+      _,
+      tooShort,
+    ) {
+      if (!tooShort) return;
+      _snack(MessagingStrings.voiceHoldHint);
+      ref.read(voiceRecordingProvider.notifier).consumeTooShort();
+    });
 
     // Cold open: state.otherUser refetch ke baad milta hai.
     // Hot open: state.otherUser bg-reconciliation ke baad update hota hai;
@@ -327,7 +746,9 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
                   notifier.cyclePin();
                 },
                 onUnpin: () async {
-                  final err = await ref.read(chatProvider.notifier).unpinFromBanner();
+                  final err = await ref
+                      .read(chatProvider.notifier)
+                      .unpinFromBanner();
                   if (err != null) _snack(err);
                 },
               ),
@@ -467,9 +888,9 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
           ),
         if (actions.showPin)
           IconButton(
-            icon: Icon(actions.isUnpin
-                ? Icons.push_pin
-                : Icons.push_pin_outlined),
+            icon: Icon(
+              actions.isUnpin ? Icons.push_pin : Icons.push_pin_outlined,
+            ),
             color: _navy,
             tooltip: actions.isUnpin
                 ? MessagingStrings.actionUnpin
@@ -485,13 +906,12 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
 
   Future<void> _copySelected() async {
     final notifier = ref.read(chatProvider.notifier);
-    final text = notifier.buildCopyText();
+    final text = notifier.copySelectedText();
     await Clipboard.setData(ClipboardData(text: text));
-    notifier.clearSelection();
     if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text(MessagingStrings.copied)),
-    );
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(const SnackBar(content: Text(MessagingStrings.copied)));
   }
 
   // Sequence (spec Parts 2 & 3): unpin is immediate; pin opens the duration
@@ -519,7 +939,10 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
       final replace = await _showReplaceOldestDialog();
       if (replace != true || !mounted) return;
       // Retry with the duration the user already picked — never re-ask.
-      outcome = await notifier.pinSelected(duration: duration, replaceOldest: true);
+      outcome = await notifier.pinSelected(
+        duration: duration,
+        replaceOldest: true,
+      );
     }
     if (outcome.kind == PinOutcomeKind.failed && outcome.message != null) {
       _snack(outcome.message!);
@@ -569,15 +992,21 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
                   child: Column(
                     mainAxisSize: MainAxisSize.min,
                     children: [
-                      _durationOption(PinDuration.twentyFourHours,
-                          MessagingStrings.pinDuration24h,
-                          (v) => setLocal(() => choice = v)),
-                      _durationOption(PinDuration.sevenDays,
-                          MessagingStrings.pinDuration7d,
-                          (v) => setLocal(() => choice = v)),
-                      _durationOption(PinDuration.thirtyDays,
-                          MessagingStrings.pinDuration30d,
-                          (v) => setLocal(() => choice = v)),
+                      _durationOption(
+                        PinDuration.twentyFourHours,
+                        MessagingStrings.pinDuration24h,
+                        (v) => setLocal(() => choice = v),
+                      ),
+                      _durationOption(
+                        PinDuration.sevenDays,
+                        MessagingStrings.pinDuration7d,
+                        (v) => setLocal(() => choice = v),
+                      ),
+                      _durationOption(
+                        PinDuration.thirtyDays,
+                        MessagingStrings.pinDuration30d,
+                        (v) => setLocal(() => choice = v),
+                      ),
                     ],
                   ),
                 ),
@@ -588,7 +1017,8 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
               TextButton(
                 onPressed: () => Navigator.pop(ctx),
                 style: TextButton.styleFrom(
-                    foregroundColor: _navy.withValues(alpha: 0.55)),
+                  foregroundColor: _navy.withValues(alpha: 0.55),
+                ),
                 child: const Text(MessagingStrings.cancel),
               ),
               FilledButton(
@@ -655,17 +1085,15 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
         content: Text(
           MessagingStrings.pinReplaceSubtitle,
           textAlign: TextAlign.start,
-          style: TextStyle(
-            fontSize: 14,
-            color: _navy.withValues(alpha: 0.60),
-          ),
+          style: TextStyle(fontSize: 14, color: _navy.withValues(alpha: 0.60)),
         ),
         actionsAlignment: MainAxisAlignment.end,
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(ctx),
             style: TextButton.styleFrom(
-                foregroundColor: _navy.withValues(alpha: 0.55)),
+              foregroundColor: _navy.withValues(alpha: 0.55),
+            ),
             child: const Text(MessagingStrings.cancel),
           ),
           FilledButton(
@@ -719,8 +1147,12 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
     }
   }
 
-  Widget _deleteOption(BuildContext ctx, String label, String? value,
-      {bool muted = false}) {
+  Widget _deleteOption(
+    BuildContext ctx,
+    String label,
+    String? value, {
+    bool muted = false,
+  }) {
     return SimpleDialogOption(
       onPressed: () => Navigator.pop(ctx, value),
       child: Padding(
@@ -774,18 +1206,24 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
       // The sentence is built here (server body is empty). "You" vs the other's
       // name is decided from isMine, the same signal bubbles use — no new source.
       if (m.type == MessageType.system) {
-        rows.add(_SystemNotice(
-          text: systemMessageText(
-            eventType: m.systemEventType,
-            isMine: m.isMine,
-            otherName: state.otherUser?.fullName ??
-                widget.summary?.otherUser.fullName ??
-                '',
+        rows.add(
+          _SystemNotice(
+            text: systemMessageText(
+              eventType: m.systemEventType,
+              isMine: m.isMine,
+              otherName:
+                  state.otherUser?.fullName ??
+                  widget.summary?.otherUser.fullName ??
+                  '',
+            ),
           ),
-        ));
-        final isOldestOfDay = i == msgs.length - 1 ||
+        );
+        final isOldestOfDay =
+            i == msgs.length - 1 ||
             !_sameLocalDay(msgs[i].createdAt, msgs[i + 1].createdAt);
-        if (isOldestOfDay) rows.add(_DaySeparator(timestamp: msgs[i].createdAt));
+        if (isOldestOfDay) {
+          rows.add(_DaySeparator(timestamp: msgs[i].createdAt));
+        }
         continue;
       }
       // F-M5: stable GlobalKey per message — Scrollable.ensureVisible ke liye.
@@ -797,6 +1235,8 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
         selected: state.selectedMessageIds.contains(m.id),
         highlighted: _highlightedMessageId == m.id,
         otherUserId: state.otherUserId,
+        // M4 — one watermark for the whole conversation; the bubble derives its tick.
+        otherLastReadAt: state.otherLastReadAt,
         // clientId sirf optimistic (failed) entries pe hota hai — null par no-op (koi `!` nahi).
         onRetry: () {
           final cid = m.clientId;
@@ -815,17 +1255,24 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
         onTapQuote: m.replyTo != null
             ? () => _jumpToQuoted(m.replyTo!.messageId)
             : null,
+        // F-M7: tapping an existing chip toggles the caller's reaction with it.
+        onReact: (emoji) => _react(m.id, emoji),
+        // F-M5: tapping media opens the full-screen viewer (confirmed only).
+        onOpenViewer: () => _openViewer(m),
       );
       // F-M5: swipe-to-reply wrapper. Disabled in selection mode and on tombstones.
-      rows.add(_SwipeToReply(
-        enabled: !state.isSelecting && !m.isDeleted,
-        onReply: () {
-          ref.read(chatProvider.notifier).setDraftReply(m);
-          _focus.requestFocus();
-        },
-        child: row,
-      ));
-      final isOldestOfDay = i == msgs.length - 1 ||
+      rows.add(
+        _SwipeToReply(
+          enabled: !state.isSelecting && !m.isDeleted,
+          onReply: () {
+            ref.read(chatProvider.notifier).setDraftReply(m);
+            _focus.requestFocus();
+          },
+          child: row,
+        ),
+      );
+      final isOldestOfDay =
+          i == msgs.length - 1 ||
           !_sameLocalDay(msgs[i].createdAt, msgs[i + 1].createdAt);
       if (isOldestOfDay) rows.add(_DaySeparator(timestamp: msgs[i].createdAt));
     }
@@ -833,9 +1280,9 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
     if (state.isLoadingOlder) {
       rows.add(const _OlderSpinner());
     } else if (state.loadOlderFailed) {
-      rows.add(_OlderRetry(
-        onRetry: () => ref.read(chatProvider.notifier).loadOlder(),
-      ));
+      rows.add(
+        _OlderRetry(onRetry: () => ref.read(chatProvider.notifier).loadOlder()),
+      );
     }
 
     return ListView.builder(
@@ -860,16 +1307,25 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            Icon(Icons.error_outline, size: 40, color: _navy.withValues(alpha: 0.3)),
+            Icon(
+              Icons.error_outline,
+              size: 40,
+              color: _navy.withValues(alpha: 0.3),
+            ),
             const SizedBox(height: 16),
             Text(
               message,
               textAlign: TextAlign.center,
-              style: TextStyle(fontSize: 14, color: _navy.withValues(alpha: 0.55)),
+              style: TextStyle(
+                fontSize: 14,
+                color: _navy.withValues(alpha: 0.55),
+              ),
             ),
             const SizedBox(height: 20),
             OutlinedButton(
-              onPressed: () => ref.read(chatProvider.notifier).open(
+              onPressed: () => ref
+                  .read(chatProvider.notifier)
+                  .open(
                     conversationId: widget.conversationId,
                     summary: widget.summary,
                   ),
@@ -905,133 +1361,451 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
     if (status == ConversationStatus.pending) {
       return state.isRequest
           ? _acceptDeclineBar(state) // State C — viewer = recipient
-          : _infoStrip(MessagingStrings.stateBWaiting); // State B — viewer = initiator
+          : _infoStrip(
+              MessagingStrings.stateBWaiting,
+            ); // State B — viewer = initiator
     }
     if (status == ConversationStatus.declined) {
       return _infoStrip(MessagingStrings.stateDeclined); // State D
     }
-    return _infoStrip(MessagingStrings.chatUnavailable); // unknown (null summary)
+    return _infoStrip(
+      MessagingStrings.chatUnavailable,
+    ); // unknown (null summary)
   }
 
   Widget _composer(ChatState state) {
+    // F-M11: while a voice note is being recorded the composer is covered by the
+    // recording UI. The normal Column stays MOUNTED underneath (as a Stack layer)
+    // so the mic's press-and-hold GestureDetector keeps receiving the same drag —
+    // rebuilding it away mid-gesture would break slide-to-cancel / drag-to-lock.
+    final recording = ref.watch(voiceRecordingProvider);
     return SafeArea(
       top: false,
       child: Container(
         decoration: BoxDecoration(
           color: Colors.white,
-          border: Border(
-            top: BorderSide(color: _navy.withValues(alpha: 0.08)),
-          ),
+          border: Border(top: BorderSide(color: _navy.withValues(alpha: 0.08))),
         ),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
+        child: Stack(
           children: [
-            // F-M6: edit banner — shown when draftEdit is set (distinct from reply preview).
-            if (state.draftEdit != null)
-              _editBanner(onCancel: _cancelEdit),
-            // F-M5: reply preview banner — shown when draftReply is set.
-            if (state.draftEdit == null && state.draftReply != null)
-              _replyPreviewBanner(
-                reply: state.draftReply!,
-                otherUserId: state.otherUserId,
-              ),
-            Padding(
-              padding: const EdgeInsetsDirectional.fromSTEB(12, 8, 12, 8),
-              child: ValueListenableBuilder<TextEditingValue>(
-                valueListenable: _input,
-                builder: (context, value, _) {
-                  final len = value.text.characters.length;
-                  final canSend = value.text.trim().isNotEmpty;
-                  final remaining = MessagingStrings.messageCharLimit - len;
-                  final showCounter =
-                      len >= MessagingStrings.messageCharCounterThreshold;
+            Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                // F-M6: edit banner — shown when draftEdit is set (distinct from reply preview).
+                if (state.draftEdit != null) _editBanner(onCancel: _cancelEdit),
+                // F-M5: reply preview banner — shown when draftReply is set.
+                if (state.draftEdit == null && state.draftReply != null)
+                  _replyPreviewBanner(
+                    reply: state.draftReply!,
+                    otherUserId: state.otherUserId,
+                  ),
+                Padding(
+                  padding: const EdgeInsetsDirectional.fromSTEB(12, 8, 12, 8),
+                  child: ValueListenableBuilder<TextEditingValue>(
+                    valueListenable: _input,
+                    builder: (context, value, _) {
+                      final len = value.text.characters.length;
+                      final canSend = value.text.trim().isNotEmpty;
+                      final remaining = MessagingStrings.messageCharLimit - len;
+                      final showCounter =
+                          len >= MessagingStrings.messageCharCounterThreshold;
 
-                  return Column(
-                    mainAxisSize: MainAxisSize.min,
-                    crossAxisAlignment: CrossAxisAlignment.end,
-                    children: [
-                      if (showCounter)
-                        Padding(
-                          padding:
-                              const EdgeInsetsDirectional.only(end: 8, bottom: 2),
-                          child: Text(
-                            formatCount(remaining),
-                            style: TextStyle(
-                              fontSize: 11,
-                              color: remaining <= 0
-                                  ? Colors.red.shade700
-                                  : _navy.withValues(alpha: 0.45),
-                            ),
-                          ),
-                        ),
-                      Row(
+                      return Column(
+                        mainAxisSize: MainAxisSize.min,
                         crossAxisAlignment: CrossAxisAlignment.end,
                         children: [
-                          Expanded(
-                            child: TextField(
-                              controller: _input,
-                              focusNode: _focus,
-                              minLines: 1,
-                              maxLines: 5,
-                              keyboardType: TextInputType.multiline,
-                              textInputAction: TextInputAction.newline,
-                              textAlignVertical: TextAlignVertical.center,
-                              inputFormatters: [
-                                LengthLimitingTextInputFormatter(
-                                    MessagingStrings.messageCharLimit),
-                              ],
-                              style: const TextStyle(color: _navy, fontSize: 15),
-                              decoration: InputDecoration(
-                                hintText: MessagingStrings.composerHint,
-                                hintStyle:
-                                    TextStyle(color: _navy.withValues(alpha: 0.40)),
-                                filled: true,
-                                fillColor: _ivory,
-                                contentPadding: const EdgeInsets.symmetric(
-                                    horizontal: 16, vertical: 10),
-                                border: OutlineInputBorder(
-                                  borderRadius: BorderRadius.circular(20),
-                                  borderSide: BorderSide(
-                                      color: _navy.withValues(alpha: 0.12)),
-                                ),
-                                enabledBorder: OutlineInputBorder(
-                                  borderRadius: BorderRadius.circular(20),
-                                  borderSide: BorderSide(
-                                      color: _navy.withValues(alpha: 0.12)),
-                                ),
-                                focusedBorder: OutlineInputBorder(
-                                  borderRadius: BorderRadius.circular(20),
-                                  borderSide: BorderSide(
-                                      color: _gold.withValues(alpha: 0.65),
-                                      width: 1.2),
+                          if (showCounter)
+                            Padding(
+                              padding: const EdgeInsetsDirectional.only(
+                                end: 8,
+                                bottom: 2,
+                              ),
+                              child: Text(
+                                formatCount(remaining),
+                                style: TextStyle(
+                                  fontSize: 11,
+                                  color: remaining <= 0
+                                      ? Colors.red.shade700
+                                      : _navy.withValues(alpha: 0.45),
                                 ),
                               ),
                             ),
-                          ),
-                          const SizedBox(width: 8),
-                          // Send — navy fill circle (gold never a button fill).
-                          Material(
-                            color: canSend ? _navy : _navy.withValues(alpha: 0.25),
-                            shape: const CircleBorder(),
-                            child: InkWell(
-                              customBorder: const CircleBorder(),
-                              onTap: canSend ? _submit : null,
-                              child: const Padding(
-                                padding: EdgeInsets.all(10),
-                                child: Icon(Icons.send_rounded,
-                                    color: Colors.white, size: 20),
+                          Row(
+                            crossAxisAlignment: CrossAxisAlignment.end,
+                            children: [
+                              // F-M5: attachment button — leading side, opens the
+                              // Gallery/Camera sheet. Hidden while editing a message
+                              // (an edit only changes text; attaching makes no sense).
+                              if (state.draftEdit == null)
+                                IconButton(
+                                  icon: Icon(
+                                    Icons.add_circle_outline_rounded,
+                                    color: _navy.withValues(alpha: 0.65),
+                                  ),
+                                  tooltip: MessagingStrings.attachTooltip,
+                                  onPressed: _openAttachmentSheet,
+                                ),
+                              Expanded(
+                                child: TextField(
+                                  controller: _input,
+                                  focusNode: _focus,
+                                  minLines: 1,
+                                  maxLines: 5,
+                                  keyboardType: TextInputType.multiline,
+                                  textInputAction: TextInputAction.newline,
+                                  textAlignVertical: TextAlignVertical.center,
+                                  inputFormatters: [
+                                    LengthLimitingTextInputFormatter(
+                                      MessagingStrings.messageCharLimit,
+                                    ),
+                                  ],
+                                  style: const TextStyle(
+                                    color: _navy,
+                                    fontSize: 15,
+                                  ),
+                                  decoration: InputDecoration(
+                                    hintText: MessagingStrings.composerHint,
+                                    hintStyle: TextStyle(
+                                      color: _navy.withValues(alpha: 0.40),
+                                    ),
+                                    filled: true,
+                                    fillColor: _ivory,
+                                    contentPadding: const EdgeInsets.symmetric(
+                                      horizontal: 16,
+                                      vertical: 10,
+                                    ),
+                                    border: OutlineInputBorder(
+                                      borderRadius: BorderRadius.circular(20),
+                                      borderSide: BorderSide(
+                                        color: _navy.withValues(alpha: 0.12),
+                                      ),
+                                    ),
+                                    enabledBorder: OutlineInputBorder(
+                                      borderRadius: BorderRadius.circular(20),
+                                      borderSide: BorderSide(
+                                        color: _navy.withValues(alpha: 0.12),
+                                      ),
+                                    ),
+                                    focusedBorder: OutlineInputBorder(
+                                      borderRadius: BorderRadius.circular(20),
+                                      borderSide: BorderSide(
+                                        color: _gold.withValues(alpha: 0.65),
+                                        width: 1.2,
+                                      ),
+                                    ),
+                                  ),
+                                ),
                               ),
-                            ),
+                              const SizedBox(width: 8),
+                              // F-M11: mic (empty field) ⇄ send (any text), animated so
+                              // it doesn't flicker per keystroke. Editing always shows
+                              // send. Decision is a pure fn (resolveComposerAction).
+                              _trailingControl(value.text, state, canSend),
+                            ],
                           ),
                         ],
-                      ),
-                    ],
-                  );
-                },
-              ),
+                      );
+                    },
+                  ),
+                ),
+              ],
             ),
+            // Holding (unlocked) recording UI — visual only (IgnorePointer) so the
+            // mic GestureDetector beneath keeps the continuous hold-drag.
+            if (recording.isActive && !recording.isLocked)
+              Positioned.fill(
+                child: IgnorePointer(child: _holdingOverlay(recording)),
+              ),
+            // Locked panel is interactive (delete / pause-resume / send).
+            if (recording.isActive && recording.isLocked)
+              Positioned.fill(child: _lockedPanel(recording)),
           ],
         ),
+      ),
+    );
+  }
+
+  // ── F-M11: composer mic/send swap + recording UI ────────────────────────────
+
+  // Empty field → mic, any text → send (pure resolveComposerAction). Editing always
+  // shows send. AnimatedSwitcher keeps the swap from flickering on every keystroke.
+  Widget _trailingControl(String text, ChatState state, bool canSend) {
+    final isEdit = state.draftEdit != null;
+    final action = isEdit ? ComposerAction.send : resolveComposerAction(text);
+    final Widget control;
+    if (action == ComposerAction.send) {
+      control = Material(
+        key: const ValueKey('send'),
+        color: canSend ? _navy : _navy.withValues(alpha: 0.25),
+        shape: const CircleBorder(),
+        child: InkWell(
+          customBorder: const CircleBorder(),
+          onTap: canSend ? _submit : null,
+          child: const Padding(
+            padding: EdgeInsets.all(10),
+            child: Icon(Icons.send_rounded, color: Colors.white, size: 20),
+          ),
+        ),
+      );
+    } else {
+      control = _micButton();
+    }
+    return AnimatedSwitcher(
+      duration: const Duration(milliseconds: 180),
+      transitionBuilder: (child, anim) => ScaleTransition(
+        scale: anim,
+        child: FadeTransition(opacity: anim, child: child),
+      ),
+      child: control,
+    );
+  }
+
+  // Press-and-hold to record. A quick tap (no hold) hints to hold. The three
+  // long-press callbacks form ONE continuous gesture: start → move (cancel/lock) →
+  // end (send/cancel/keep-locked).
+  Widget _micButton() {
+    return Semantics(
+      button: true,
+      label: MessagingStrings.voiceRecordTooltip,
+      child: GestureDetector(
+        key: const ValueKey('mic'),
+        onTap: () => _snack(MessagingStrings.voiceHoldHint),
+        onLongPressStart: _onMicHoldStart,
+        onLongPressMoveUpdate: _onMicHoldMove,
+        onLongPressEnd: _onMicHoldEnd,
+        child: Material(
+          color: _navy,
+          shape: const CircleBorder(),
+          child: const Padding(
+            padding: EdgeInsets.all(10),
+            child: Icon(Icons.mic_rounded, color: Colors.white, size: 20),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Future<void> _onMicHoldStart(LongPressStartDetails d) async {
+    _holdOffset = Offset.zero;
+    _holdLocked = false;
+    _holdOutcome = RecordDragOutcome.none;
+    HapticFeedback.lightImpact(); // light haptic on start
+    final ok = await ref.read(voiceRecordingProvider.notifier).start();
+    if (!mounted) return;
+    if (!ok) {
+      _showMicPermissionDialog(); // denied — explain + offer settings
+      return;
+    }
+    setState(() {});
+  }
+
+  void _onMicHoldMove(LongPressMoveUpdateDetails d) {
+    if (_holdLocked) return; // already locked — ignore further drag
+    if (!ref.read(voiceRecordingProvider).isActive) return; // never started
+    _holdOffset = d.offsetFromOrigin;
+    final outcome = resolveRecordingDrag(
+      dragX: _holdOffset.dx,
+      dragY: _holdOffset.dy,
+      direction: Directionality.of(context),
+    );
+    if (outcome == RecordDragOutcome.lock) {
+      _holdLocked = true;
+      HapticFeedback.mediumImpact();
+      ref.read(voiceRecordingProvider.notifier).lock();
+    }
+    setState(() => _holdOutcome = outcome);
+  }
+
+  void _onMicHoldEnd(LongPressEndDetails d) {
+    if (_holdLocked) {
+      _resetHold(); // locked recording continues hands-free
+      return;
+    }
+    final notifier = ref.read(voiceRecordingProvider.notifier);
+    if (ref.read(voiceRecordingProvider).isActive) {
+      if (_holdOutcome == RecordDragOutcome.cancel) {
+        notifier.cancel(); // crossed cancel → discard + delete file
+      } else {
+        notifier.finish(); // released → send (or discarded if under 1 s)
+      }
+    }
+    _resetHold();
+  }
+
+  void _resetHold() {
+    if (!mounted) return;
+    setState(() {
+      _holdOffset = Offset.zero;
+      _holdOutcome = RecordDragOutcome.none;
+      _holdLocked = false;
+    });
+  }
+
+  Future<void> _showMicPermissionDialog() async {
+    if (!mounted) return;
+    await showDialog<void>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: Colors.white,
+        title: const Text(
+          MessagingStrings.permissionMicTitle,
+          style: TextStyle(
+            fontSize: 17,
+            fontWeight: FontWeight.w700,
+            color: _navy,
+          ),
+        ),
+        content: Text(
+          MessagingStrings.permissionMicBody,
+          textAlign: TextAlign.start,
+          style: TextStyle(fontSize: 14, color: _navy.withValues(alpha: 0.6)),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            style: TextButton.styleFrom(
+              foregroundColor: _navy.withValues(alpha: 0.55),
+            ),
+            child: const Text(MessagingStrings.permissionDismiss),
+          ),
+          FilledButton(
+            onPressed: () {
+              Navigator.pop(ctx);
+              AppSettings.openAppSettings();
+            },
+            style: FilledButton.styleFrom(
+              backgroundColor: _navy,
+              foregroundColor: Colors.white,
+              shape: const StadiumBorder(),
+            ),
+            child: const Text(MessagingStrings.permissionOpenSettings),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // Unlocked (finger-down) recording UI: timer (leading) · slide-to-cancel hint
+  // (following the finger, fading toward the cancel threshold) · a lock affordance
+  // filling as the finger rises. Directions are start/end so RTL mirrors correctly.
+  Widget _holdingOverlay(VoiceRecordingState rec) {
+    final ltr = Directionality.of(context) == TextDirection.ltr;
+    const cancelT = RecordDragThresholds.cancel;
+    const lockT = RecordDragThresholds.lock;
+    final startward = ((ltr ? -_holdOffset.dx : _holdOffset.dx)).clamp(
+      0.0,
+      cancelT,
+    );
+    final cancelProgress = (startward / cancelT).clamp(0.0, 1.0);
+    final upward = (-_holdOffset.dy).clamp(0.0, lockT);
+    final lockProgress = (upward / lockT).clamp(0.0, 1.0);
+
+    return Container(
+      color: Colors.white,
+      padding: const EdgeInsetsDirectional.fromSTEB(16, 8, 12, 8),
+      child: Row(
+        children: [
+          _RecordingDot(paused: false),
+          const SizedBox(width: 10),
+          Text(
+            formatMediaDuration(rec.elapsedMs),
+            textAlign: TextAlign.start,
+            style: const TextStyle(
+              fontSize: 14,
+              fontWeight: FontWeight.w600,
+              color: _navy,
+            ),
+          ),
+          Expanded(
+            child: Transform.translate(
+              offset: Offset(ltr ? -startward : startward, 0),
+              child: Opacity(
+                opacity: (1 - cancelProgress).clamp(0.0, 1.0),
+                child: Row(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    Icon(
+                      Icons.chevron_left_rounded,
+                      size: 18,
+                      color: _navy.withValues(alpha: 0.45),
+                    ),
+                    Text(
+                      MessagingStrings.voiceSlideToCancel,
+                      textAlign: TextAlign.start,
+                      style: TextStyle(
+                        fontSize: 13,
+                        color: _navy.withValues(alpha: 0.5),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+          const SizedBox(width: 8),
+          _LockAffordance(progress: lockProgress),
+        ],
+      ),
+    );
+  }
+
+  // Locked (hands-free) panel: delete · pause/resume (label+icon reflect state) ·
+  // send. The timer stops while paused (elapsedMs is frozen by the notifier).
+  Widget _lockedPanel(VoiceRecordingState rec) {
+    final notifier = ref.read(voiceRecordingProvider.notifier);
+    return Container(
+      color: Colors.white,
+      padding: const EdgeInsetsDirectional.fromSTEB(8, 8, 12, 8),
+      child: Row(
+        children: [
+          IconButton(
+            icon: Icon(
+              Icons.delete_outline_rounded,
+              color: Colors.red.shade400,
+            ),
+            tooltip: MessagingStrings.voiceDelete,
+            onPressed: () => notifier.cancel(),
+          ),
+          _RecordingDot(paused: rec.isPaused),
+          const SizedBox(width: 8),
+          Text(
+            formatMediaDuration(rec.elapsedMs),
+            textAlign: TextAlign.start,
+            style: const TextStyle(
+              fontSize: 14,
+              fontWeight: FontWeight.w600,
+              color: _navy,
+            ),
+          ),
+          const Spacer(),
+          TextButton.icon(
+            onPressed: () =>
+                rec.isPaused ? notifier.resume() : notifier.pause(),
+            style: TextButton.styleFrom(foregroundColor: _navy),
+            icon: Icon(
+              rec.isPaused ? Icons.play_arrow_rounded : Icons.pause_rounded,
+              size: 20,
+            ),
+            label: Text(
+              rec.isPaused
+                  ? MessagingStrings.voiceResume
+                  : MessagingStrings.voicePause,
+            ),
+          ),
+          const SizedBox(width: 8),
+          Material(
+            color: _navy,
+            shape: const CircleBorder(),
+            child: InkWell(
+              customBorder: const CircleBorder(),
+              onTap: () => notifier.finish(),
+              child: const Padding(
+                padding: EdgeInsets.all(10),
+                child: Icon(Icons.send_rounded, color: Colors.white, size: 20),
+              ),
+            ),
+          ),
+        ],
       ),
     );
   }
@@ -1043,8 +1817,9 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
     required String? otherUserId,
   }) {
     final isReplyMine = otherUserId != null && reply.senderId != otherUserId;
-    final displayName =
-        isReplyMine ? MessagingStrings.replyYou : reply.senderName;
+    final displayName = isReplyMine
+        ? MessagingStrings.replyYou
+        : reply.senderName;
     final mutedColor = _navy.withValues(alpha: 0.55);
 
     return Container(
@@ -1151,23 +1926,41 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
       return Text(
         MessagingStrings.replyDeletedQuote,
         textAlign: TextAlign.start,
-        style: TextStyle(fontSize: 12, fontStyle: FontStyle.italic, color: color),
+        style: TextStyle(
+          fontSize: 12,
+          fontStyle: FontStyle.italic,
+          color: color,
+        ),
       );
     }
     return switch (reply.type) {
-      MessageType.image =>
-        _replyTypeRow(Icons.image_rounded, MessagingStrings.replyPhoto, color),
-      MessageType.file =>
-        _replyTypeRow(Icons.attach_file_rounded, MessagingStrings.replyFile, color),
-      MessageType.voice =>
-        _replyTypeRow(Icons.mic_rounded, MessagingStrings.replyVoice, color),
+      MessageType.image => _replyTypeRow(
+        Icons.image_rounded,
+        MessagingStrings.replyPhoto,
+        color,
+      ),
+      MessageType.video => _replyTypeRow(
+        Icons.videocam_rounded,
+        MessagingStrings.replyVideo,
+        color,
+      ),
+      MessageType.file => _replyTypeRow(
+        Icons.attach_file_rounded,
+        MessagingStrings.replyFile,
+        color,
+      ),
+      MessageType.voice => _replyTypeRow(
+        Icons.mic_rounded,
+        MessagingStrings.replyVoice,
+        color,
+      ),
       _ => Text(
-          reply.bodySnippet,
-          maxLines: 1,
-          overflow: TextOverflow.ellipsis,
-          textAlign: TextAlign.start,
-          style: TextStyle(fontSize: 12, color: color),
-        ),
+        reply.bodySnippet,
+        maxLines: 1,
+        overflow: TextOverflow.ellipsis,
+        textAlign: TextAlign.start,
+        style: TextStyle(fontSize: 12, color: color),
+      ),
     };
   }
 
@@ -1203,8 +1996,10 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
                   child: SizedBox(
                     width: 20,
                     height: 20,
-                    child:
-                        CircularProgressIndicator(strokeWidth: 2, color: _gold),
+                    child: CircularProgressIndicator(
+                      strokeWidth: 2,
+                      color: _gold,
+                    ),
                   ),
                 ),
               )
@@ -1217,12 +2012,18 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
                         onPressed: _decline,
                         style: OutlinedButton.styleFrom(
                           foregroundColor: _navy,
-                          side: BorderSide(color: _navy.withValues(alpha: 0.30)),
+                          side: BorderSide(
+                            color: _navy.withValues(alpha: 0.30),
+                          ),
                           shape: const StadiumBorder(),
                         ),
-                        child: const Text(MessagingStrings.decline,
-                            style: TextStyle(
-                                fontSize: 14, fontWeight: FontWeight.w600)),
+                        child: const Text(
+                          MessagingStrings.decline,
+                          style: TextStyle(
+                            fontSize: 14,
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
                       ),
                     ),
                   ),
@@ -1237,9 +2038,13 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
                           foregroundColor: Colors.white,
                           shape: const StadiumBorder(),
                         ),
-                        child: const Text(MessagingStrings.accept,
-                            style: TextStyle(
-                                fontSize: 14, fontWeight: FontWeight.w700)),
+                        child: const Text(
+                          MessagingStrings.accept,
+                          style: TextStyle(
+                            fontSize: 14,
+                            fontWeight: FontWeight.w700,
+                          ),
+                        ),
                       ),
                     ),
                   ),
@@ -1262,7 +2067,11 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
         ),
         child: Row(
           children: [
-            Icon(Icons.info_outline, size: 18, color: _navy.withValues(alpha: 0.45)),
+            Icon(
+              Icons.info_outline,
+              size: 18,
+              color: _navy.withValues(alpha: 0.45),
+            ),
             const SizedBox(width: 10),
             Expanded(
               child: Text(
@@ -1301,6 +2110,9 @@ class _MessageRow extends StatelessWidget {
     this.highlighted = false,
     this.otherUserId,
     this.onTapQuote,
+    this.otherLastReadAt,
+    this.onReact,
+    this.onOpenViewer,
   });
 
   final ChatMessage message;
@@ -1312,6 +2124,9 @@ class _MessageRow extends StatelessWidget {
   final bool highlighted;
   final String? otherUserId;
   final VoidCallback? onTapQuote;
+  final DateTime? otherLastReadAt; // M4 read-receipt watermark (UTC)
+  final ValueChanged<String>? onReact; // F-M7 chip tap → toggle that emoji
+  final VoidCallback? onOpenViewer; // F-M5 media tap → full-screen viewer
 
   static const _navy = Color(0xFF0A1633);
   static const _gold = Color(0xFFC0A062);
@@ -1335,6 +2150,9 @@ class _MessageRow extends StatelessWidget {
           onRetry: onRetry,
           otherUserId: otherUserId,
           onTapQuote: onTapQuote,
+          otherLastReadAt: otherLastReadAt,
+          onReact: onReact,
+          onOpenViewer: onOpenViewer,
         ),
       ),
     );
@@ -1347,14 +2165,21 @@ class _MessageBubble extends StatelessWidget {
     required this.onRetry,
     this.otherUserId,
     this.onTapQuote,
+    this.otherLastReadAt,
+    this.onReact,
+    this.onOpenViewer,
   });
 
   final ChatMessage message;
   final VoidCallback onRetry;
   final String? otherUserId;
   final VoidCallback? onTapQuote;
+  final DateTime? otherLastReadAt; // M4 read-receipt watermark (UTC)
+  final ValueChanged<String>? onReact; // F-M7 chip tap → toggle that emoji
+  final VoidCallback? onOpenViewer; // F-M5 media tap → full-screen viewer
 
   static const _navy = Color(0xFF0A1633);
+  static const _gold = Color(0xFFC0A062);
 
   @override
   Widget build(BuildContext context) {
@@ -1376,8 +2201,10 @@ class _MessageBubble extends StatelessWidget {
           decoration: BoxDecoration(
             color: mine ? _navy.withValues(alpha: 0.04) : Colors.white,
             borderRadius: BorderRadius.circular(16),
-            border:
-                Border.all(color: _navy.withValues(alpha: 0.08), width: 0.5),
+            border: Border.all(
+              color: _navy.withValues(alpha: 0.08),
+              width: 0.5,
+            ),
           ),
           child: Row(
             mainAxisSize: MainAxisSize.min,
@@ -1404,9 +2231,21 @@ class _MessageBubble extends StatelessWidget {
     final pending = message.status == ChatSendStatus.pending;
     final failed = message.status == ChatSendStatus.failed;
 
-    // Sirf Text ban sakta hai M1 mein; anokha type → neutral placeholder (crash nahi).
+    // F-M5: image/video render a thumbnail + optional caption (body). F-M11: voice
+    // renders the voice bubble. Text renders its body; any OTHER non-text type
+    // (file/unknown) → neutral placeholder.
     final isText = message.type == MessageType.text;
-    final bodyText = isText ? message.body : MessagingStrings.unsupportedMessage;
+    final isMedia =
+        message.type == MessageType.image || message.type == MessageType.video;
+    final isVoice = message.type == MessageType.voice;
+    final hasCaption = message.body.isNotEmpty;
+    final bodyText = isText
+        ? message.body
+        : MessagingStrings.unsupportedMessage;
+    // Tap-to-view only once confirmed and the full asset URL exists.
+    final canView =
+        message.status == ChatSendStatus.confirmed &&
+        (message.mediaUrl?.isNotEmpty ?? false);
 
     final bubbleColor = mine ? _navy : Colors.white;
     final textColor = mine ? Colors.white : _navy;
@@ -1435,7 +2274,8 @@ class _MessageBubble extends StatelessWidget {
               _QuotedBlock(
                 reply: message.replyTo!,
                 mine: mine,
-                isReplyMine: otherUserId != null &&
+                isReplyMine:
+                    otherUserId != null &&
                     message.replyTo!.senderId != otherUserId,
                 onTap: onTapQuote,
               ),
@@ -1446,8 +2286,11 @@ class _MessageBubble extends StatelessWidget {
                 child: Row(
                   mainAxisSize: MainAxisSize.min,
                   children: [
-                    Icon(Icons.forward_rounded,
-                        size: 11, color: textColor.withValues(alpha: 0.45)),
+                    Icon(
+                      Icons.forward_rounded,
+                      size: 11,
+                      color: textColor.withValues(alpha: 0.45),
+                    ),
                     const SizedBox(width: 3),
                     Text(
                       MessagingStrings.forwardedLabel,
@@ -1461,41 +2304,108 @@ class _MessageBubble extends StatelessWidget {
                   ],
                 ),
               ),
-            Text(
-              bodyText,
-              textAlign: TextAlign.start,
-              style: TextStyle(
-                fontSize: 15,
-                color: textColor,
-                fontStyle: isText ? FontStyle.normal : FontStyle.italic,
+            // F-M5: media thumbnail (image/video). Coexists ABOVE the caption and
+            // BELOW the quoted/forwarded blocks, so a forwarded reply with a caption
+            // and reactions still lays out correctly.
+            if (isMedia)
+              MediaBubbleContent(
+                message: message,
+                onOpenViewer: canView ? onOpenViewer : null,
               ),
-            ),
-            const SizedBox(height: 3),
-            Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                // Pin indicator — muted, low visual weight, sits before the time.
-                if (message.isPinned) ...[
-                  Icon(Icons.push_pin,
-                      size: 11, color: textColor.withValues(alpha: 0.6)),
-                  const SizedBox(width: 4),
-                ],
-                _meta(
+            if (isMedia && hasCaption)
+              Padding(
+                padding: const EdgeInsetsDirectional.only(top: 6),
+                child: Text(
+                  message.body,
+                  textAlign: TextAlign.start,
+                  style: TextStyle(fontSize: 15, color: textColor),
+                ),
+              ),
+            // F-M11: voice note — avatar+badge | play/pause | waveform | meta row.
+            // VoiceBubble owns the meta row (duration + ticks), so the shared meta
+            // row below is suppressed for voice messages.
+            if (isVoice)
+              VoiceBubble(
+                message: message,
+                mine: mine,
+                otherLastReadAt: otherLastReadAt,
+                onRetry: onRetry,
+              ),
+            // Text body (or the neutral placeholder for file/unknown) — never voice.
+            if (!isMedia && !isVoice)
+              Text(
+                bodyText,
+                textAlign: TextAlign.start,
+                style: TextStyle(
+                  fontSize: 15,
+                  color: textColor,
+                  fontStyle: isText ? FontStyle.normal : FontStyle.italic,
+                ),
+              ),
+            // Voice bubble owns its meta row — skip shared one to avoid duplication.
+            if (!isVoice) ...[
+              const SizedBox(height: 3),
+              Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  // Pin indicator — muted, low visual weight, sits before the time.
+                  if (message.isPinned) ...[
+                    Icon(
+                      Icons.push_pin,
+                      size: 11,
+                      color: textColor.withValues(alpha: 0.6),
+                    ),
+                    const SizedBox(width: 4),
+                  ],
+                  _meta(
                     mine: mine,
                     pending: pending,
                     failed: failed,
-                    textColor: textColor),
-              ],
-            ),
+                    textColor: textColor,
+                  ),
+                ],
+              ),
+            ],
           ],
         ),
       ),
     );
 
+    // F-M7 — reaction chips attach under the bubble, aligned to the bubble's own
+    // side (CrossAxisAlignment.start/end respect Directionality, so they mirror
+    // under RTL). They live OUTSIDE the bubble box, so the metadata row (timestamp,
+    // edited marker, ticks) inside the bubble is untouched.
+    final hasReactions = message.reactions.isNotEmpty;
     return Align(
-      alignment:
-          mine ? AlignmentDirectional.centerEnd : AlignmentDirectional.centerStart,
-      child: bubble,
+      alignment: mine
+          ? AlignmentDirectional.centerEnd
+          : AlignmentDirectional.centerStart,
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: mine
+            ? CrossAxisAlignment.end
+            : CrossAxisAlignment.start,
+        children: [
+          bubble,
+          if (hasReactions)
+            Padding(
+              padding: EdgeInsetsDirectional.only(
+                start: mine ? 0 : 14,
+                end: mine ? 14 : 0,
+                bottom: 4,
+              ),
+              child: ConstrainedBox(
+                constraints: BoxConstraints(
+                  maxWidth: MediaQuery.sizeOf(context).width * 0.75,
+                ),
+                child: _ReactionChips(
+                  reactions: message.reactions,
+                  onTap: onReact,
+                ),
+              ),
+            ),
+        ],
+      ),
     );
   }
 
@@ -1526,15 +2436,26 @@ class _MessageBubble extends StatelessWidget {
       return Row(
         mainAxisSize: MainAxisSize.min,
         children: [
-          Icon(Icons.schedule, size: 12, color: textColor.withValues(alpha: 0.6)),
+          Icon(
+            Icons.schedule,
+            size: 12,
+            color: textColor.withValues(alpha: 0.6),
+          ),
         ],
       );
     }
-    // F-M6: "edited" marker sits before the timestamp (muted italic).
-    if (message.editedAt != null) {
-      return Row(
-        mainAxisSize: MainAxisSize.min,
-        children: [
+    // Confirmed bubble metadata row: optional "edited" marker · timestamp · read
+    // tick. The tick joins this row (F-M6 edited marker already lives here) without
+    // pushing it to wrap — an icon is far narrower than the timestamp it follows.
+    final tick = _tickIcon(
+      resolveTickState(message, otherLastReadAt),
+      textColor: textColor,
+    );
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        // F-M6: "edited" marker sits before the timestamp (muted italic).
+        if (message.editedAt != null) ...[
           Text(
             MessagingStrings.editedMarker,
             style: TextStyle(
@@ -1544,17 +2465,42 @@ class _MessageBubble extends StatelessWidget {
             ),
           ),
           const SizedBox(width: 4),
-          Text(
-            formatBubbleTime(message.createdAt),
-            style: TextStyle(fontSize: 10, color: textColor.withValues(alpha: 0.6)),
-          ),
         ],
-      );
-    }
-    return Text(
-      formatBubbleTime(message.createdAt),
-      style: TextStyle(fontSize: 10, color: textColor.withValues(alpha: 0.6)),
+        Text(
+          formatBubbleTime(message.createdAt),
+          style: TextStyle(
+            fontSize: 10,
+            color: textColor.withValues(alpha: 0.6),
+          ),
+        ),
+        if (tick != null) ...[const SizedBox(width: 4), tick],
+      ],
     );
+  }
+
+  // M4 read receipts — three states, on the caller's OWN messages only
+  // (resolveTickState returns none for everything else, so this never renders on
+  // the other person's bubbles, system notices, tombstones, or pending/failed
+  // sends). Own bubbles sit on NAVY, so both states are tuned for a dark base:
+  //   sent → single ✓ in muted white (textColor is white on own bubbles), the
+  //          same weight as the timestamp; a plain grey ✓ would vanish on navy.
+  //   read → double ✓✓ in gold (#C0A062), the CLAUDE.md accent — high contrast on
+  //          navy and clearly distinct from the muted sent state.
+  // A tick is an icon, not a button, so gold as its colour respects "gold is never
+  // a button fill". Returns null for TickState.none (nothing rendered).
+  Widget? _tickIcon(TickState state, {required Color textColor}) {
+    switch (state) {
+      case TickState.none:
+        return null;
+      case TickState.sent:
+        return Icon(
+          Icons.check,
+          size: 13,
+          color: textColor.withValues(alpha: 0.6),
+        );
+      case TickState.read:
+        return const Icon(Icons.done_all, size: 13, color: _gold);
+    }
   }
 }
 
@@ -1612,10 +2558,7 @@ class _SystemNotice extends StatelessWidget {
         child: Text(
           text,
           textAlign: TextAlign.center,
-          style: TextStyle(
-            fontSize: 12,
-            color: _navy.withValues(alpha: 0.45),
-          ),
+          style: TextStyle(fontSize: 12, color: _navy.withValues(alpha: 0.45)),
         ),
       ),
     );
@@ -1633,7 +2576,10 @@ class _OlderSpinner extends StatelessWidget {
         child: SizedBox(
           width: 18,
           height: 18,
-          child: CircularProgressIndicator(strokeWidth: 2, color: Color(0xFFC0A062)),
+          child: CircularProgressIndicator(
+            strokeWidth: 2,
+            color: Color(0xFFC0A062),
+          ),
         ),
       ),
     );
@@ -1692,8 +2638,9 @@ class _QuotedBlock extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final senderName =
-        isReplyMine ? MessagingStrings.replyYou : reply.senderName;
+    final senderName = isReplyMine
+        ? MessagingStrings.replyYou
+        : reply.senderName;
 
     // Colors chosen to be legible on both backgrounds:
     // navy bubble (mine=true): white-tinted text; light block bg on dark base
@@ -1808,8 +2755,7 @@ class _SwipeToReplyState extends State<_SwipeToReply>
   void _onSpringTick() {
     if (!mounted) return;
     setState(() {
-      _drag = (_dragAtRelease *
-              (1.0 - Curves.easeOut.transform(_ctrl.value)))
+      _drag = (_dragAtRelease * (1.0 - Curves.easeOut.transform(_ctrl.value)))
           .clamp(0.0, _maxDrag);
       if (_ctrl.isCompleted) _triggered = false;
     });
@@ -1913,6 +2859,7 @@ class _PinBanner extends StatelessWidget {
     if (m.isDeleted) return MessagingStrings.messageDeleted;
     return switch (m.type) {
       MessageType.image => MessagingStrings.replyPhoto,
+      MessageType.video => MessagingStrings.replyVideo,
       MessageType.file => MessagingStrings.replyFile,
       MessageType.voice => MessagingStrings.replyVoice,
       _ => m.body,
@@ -1933,7 +2880,9 @@ class _PinBanner extends StatelessWidget {
         child: Container(
           height: 40,
           decoration: BoxDecoration(
-            border: Border(bottom: BorderSide(color: _navy.withValues(alpha: 0.08))),
+            border: Border(
+              bottom: BorderSide(color: _navy.withValues(alpha: 0.08)),
+            ),
           ),
           child: Row(
             children: [
@@ -1950,12 +2899,18 @@ class _PinBanner extends StatelessWidget {
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
                   textAlign: TextAlign.start,
-                  style: TextStyle(fontSize: 13, color: _navy.withValues(alpha: 0.70)),
+                  style: TextStyle(
+                    fontSize: 13,
+                    color: _navy.withValues(alpha: 0.70),
+                  ),
                 ),
               ),
               IconButton(
-                icon: Icon(Icons.push_pin_outlined,
-                    size: 16, color: _navy.withValues(alpha: 0.40)),
+                icon: Icon(
+                  Icons.push_pin_outlined,
+                  size: 16,
+                  color: _navy.withValues(alpha: 0.40),
+                ),
                 tooltip: MessagingStrings.pinBannerUnpinTooltip,
                 padding: EdgeInsets.zero,
                 constraints: const BoxConstraints(minWidth: 36, minHeight: 40),
@@ -2000,6 +2955,347 @@ class _PinSegmentBars extends StatelessWidget {
             ),
           ),
       ],
+    );
+  }
+}
+
+// ── Reaction chips (F-M7, Part 3) ─────────────────────────────────────────────
+// A wrapping row of chips under the bubble. WRAP (not cap) was chosen: reactions
+// on a 1:1 thread are few, and wrapping keeps every distinct emoji visible without
+// a hidden "+N" the user can't act on. Counts go through formatCount so Arabic /
+// Urdu render their own digits; a count of 1 shows the emoji alone.
+class _ReactionChips extends StatelessWidget {
+  const _ReactionChips({required this.reactions, this.onTap});
+
+  final List<MessageReaction> reactions;
+  final ValueChanged<String>? onTap;
+
+  static const _navy = Color(0xFF0A1633);
+  static const _gold = Color(0xFFC0A062);
+
+  @override
+  Widget build(BuildContext context) {
+    return Wrap(
+      spacing: 4,
+      runSpacing: 4,
+      children: [for (final r in reactions) _chip(r)],
+    );
+  }
+
+  Widget _chip(MessageReaction r) {
+    // reactedByMe → distinguished by the GOLD BORDER only (accent, never a fill),
+    // per CLAUDE.md. Others: hairline navy border on white.
+    final mine = r.reactedByMe;
+    return Semantics(
+      button: true,
+      selected: mine,
+      label: MessagingStrings.reactWith(r.emoji),
+      child: GestureDetector(
+        onTap: onTap == null ? null : () => onTap!(r.emoji),
+        child: Container(
+          padding: const EdgeInsetsDirectional.symmetric(
+            horizontal: 8,
+            vertical: 3,
+          ),
+          decoration: BoxDecoration(
+            color: Colors.white,
+            borderRadius: BorderRadius.circular(12),
+            border: Border.all(
+              color: mine
+                  ? _gold.withValues(alpha: 0.85)
+                  : _navy.withValues(alpha: 0.12),
+              width: mine ? 1.4 : 0.8,
+            ),
+          ),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text(r.emoji, style: const TextStyle(fontSize: 13)),
+              if (r.count > 1) ...[
+                const SizedBox(width: 3),
+                Text(
+                  formatCount(r.count),
+                  textAlign: TextAlign.start,
+                  style: TextStyle(
+                    fontSize: 11,
+                    fontWeight: FontWeight.w600,
+                    color: _navy.withValues(alpha: 0.70),
+                  ),
+                ),
+              ],
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// ── Floating reaction bar (F-M7, Part 1) ──────────────────────────────────────
+// Six quick emoji + a "+" to open the full picker. The caller's current reaction
+// is highlighted; tapping it again removes it (the same toggle the backend does).
+class _ReactionBar extends StatelessWidget {
+  const _ReactionBar({
+    required this.myEmoji,
+    required this.onSelect,
+    required this.onMore,
+  });
+
+  final String? myEmoji;
+  final ValueChanged<String> onSelect;
+  final VoidCallback onMore;
+
+  static const _navy = Color(0xFF0A1633);
+  static const _gold = Color(0xFFC0A062);
+
+  @override
+  Widget build(BuildContext context) {
+    return Material(
+      color: Colors.transparent,
+      child: Center(
+        child: Container(
+          padding: const EdgeInsetsDirectional.symmetric(
+            horizontal: 6,
+            vertical: 4,
+          ),
+          decoration: BoxDecoration(
+            color: Colors.white,
+            borderRadius: BorderRadius.circular(28),
+            boxShadow: [
+              BoxShadow(
+                color: _navy.withValues(alpha: 0.15),
+                blurRadius: 12,
+                offset: const Offset(0, 4),
+              ),
+            ],
+          ),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              for (final e in kQuickReactionEmojis) _emojiButton(e),
+              Container(
+                width: 1,
+                height: 22,
+                margin: const EdgeInsetsDirectional.symmetric(horizontal: 2),
+                color: _navy.withValues(alpha: 0.10),
+              ),
+              IconButton(
+                icon: Icon(
+                  Icons.add_rounded,
+                  color: _navy.withValues(alpha: 0.65),
+                ),
+                tooltip: MessagingStrings.reactionMoreTooltip,
+                onPressed: onMore,
+                iconSize: 20,
+                visualDensity: VisualDensity.compact,
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _emojiButton(String emoji) {
+    final selected = emoji == myEmoji;
+    return Semantics(
+      button: true,
+      label: MessagingStrings.reactWith(emoji),
+      child: InkResponse(
+        onTap: () => onSelect(emoji),
+        radius: 22,
+        child: Container(
+          padding: const EdgeInsets.all(6),
+          // Caller's current reaction → gold RING (accent), not a gold fill.
+          decoration: selected
+              ? BoxDecoration(
+                  shape: BoxShape.circle,
+                  border: Border.all(color: _gold, width: 1.6),
+                )
+              : null,
+          child: Text(emoji, style: const TextStyle(fontSize: 24)),
+        ),
+      ),
+    );
+  }
+}
+
+// ── Full emoji picker sheet (F-M7, Part 2 — curated grid, Option B) ────────────
+// ~130 curated emoji in six categories, no dependency. Selecting one pops the
+// chosen emoji back to the caller, which applies the reaction and closes. No
+// search box and no skin-tone selector this slice (noted in docs/TODO.md).
+class _EmojiPickerSheet extends StatelessWidget {
+  const _EmojiPickerSheet();
+
+  static const _navy = Color(0xFF0A1633);
+  static const _gold = Color(0xFFC0A062);
+
+  // Parallel to kEmojiPickerGroups (same order).
+  static const _labels = [
+    MessagingStrings.reactionCatSmileys,
+    MessagingStrings.reactionCatGestures,
+    MessagingStrings.reactionCatHearts,
+    MessagingStrings.reactionCatAnimals,
+    MessagingStrings.reactionCatFood,
+    MessagingStrings.reactionCatActivities,
+  ];
+
+  @override
+  Widget build(BuildContext context) {
+    return SafeArea(
+      top: false,
+      child: ConstrainedBox(
+        constraints: BoxConstraints(
+          maxHeight: MediaQuery.sizeOf(context).height * 0.6,
+        ),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Container(
+              width: 40,
+              height: 4,
+              margin: const EdgeInsets.symmetric(vertical: 10),
+              decoration: BoxDecoration(
+                color: _navy.withValues(alpha: 0.15),
+                borderRadius: BorderRadius.circular(2),
+              ),
+            ),
+            Align(
+              alignment: AlignmentDirectional.centerStart,
+              child: Padding(
+                padding: const EdgeInsetsDirectional.fromSTEB(20, 0, 20, 8),
+                child: Text(
+                  MessagingStrings.reactionPickerTitle,
+                  textAlign: TextAlign.start,
+                  style: const TextStyle(
+                    fontSize: 18,
+                    fontWeight: FontWeight.w700,
+                    color: _navy,
+                  ),
+                ),
+              ),
+            ),
+            Flexible(
+              child: ListView.builder(
+                shrinkWrap: true,
+                padding: const EdgeInsetsDirectional.fromSTEB(16, 0, 16, 12),
+                itemCount: kEmojiPickerGroups.length,
+                itemBuilder: (context, i) =>
+                    _category(context, _labels[i], kEmojiPickerGroups[i]),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _category(BuildContext context, String label, List<String> emojis) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Padding(
+          padding: const EdgeInsetsDirectional.only(
+            top: 10,
+            bottom: 6,
+            start: 4,
+          ),
+          child: Text(
+            label,
+            textAlign: TextAlign.start,
+            style: const TextStyle(
+              fontSize: 12,
+              fontWeight: FontWeight.w700,
+              letterSpacing: 1.2,
+              color: _gold,
+            ),
+          ),
+        ),
+        Wrap(
+          children: [
+            for (final e in emojis)
+              InkResponse(
+                onTap: () => Navigator.of(context).pop(e),
+                radius: 24,
+                child: Padding(
+                  padding: const EdgeInsets.all(6),
+                  child: Text(e, style: const TextStyle(fontSize: 26)),
+                ),
+              ),
+          ],
+        ),
+      ],
+    );
+  }
+}
+
+// ── F-M11 recording UI bits ───────────────────────────────────────────────────
+
+// A small red dot marking an active recording; hollow while paused.
+class _RecordingDot extends StatelessWidget {
+  const _RecordingDot({required this.paused});
+  final bool paused;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: 10,
+      height: 10,
+      decoration: BoxDecoration(
+        shape: BoxShape.circle,
+        color: paused ? Colors.transparent : Colors.red.shade400,
+        border: paused
+            ? Border.all(color: Colors.red.shade400, width: 2)
+            : null,
+      ),
+    );
+  }
+}
+
+// The lock affordance shown on the trailing side while holding. A capsule track
+// with a lock icon; a navy fill rises from the bottom as the finger rises (gold is
+// reserved as an accent, never a fill). At full fill the recording locks.
+class _LockAffordance extends StatelessWidget {
+  const _LockAffordance({required this.progress});
+  final double progress; // 0..1
+
+  static const _navy = Color(0xFF0A1633);
+  static const _gold = Color(0xFFC0A062);
+
+  @override
+  Widget build(BuildContext context) {
+    return SizedBox(
+      width: 30,
+      height: 40,
+      child: Stack(
+        alignment: Alignment.bottomCenter,
+        children: [
+          Container(
+            decoration: BoxDecoration(
+              color: _navy.withValues(alpha: 0.04),
+              borderRadius: BorderRadius.circular(15),
+              border: Border.all(color: _navy.withValues(alpha: 0.15)),
+            ),
+          ),
+          FractionallySizedBox(
+            heightFactor: progress.clamp(0.0, 1.0),
+            child: Container(
+              decoration: BoxDecoration(
+                color: _navy.withValues(alpha: 0.18),
+                borderRadius: BorderRadius.circular(15),
+              ),
+            ),
+          ),
+          Positioned(
+            top: 6,
+            child: Icon(
+              Icons.lock_outline_rounded,
+              size: 15,
+              color: progress >= 1.0 ? _gold : _navy.withValues(alpha: 0.55),
+            ),
+          ),
+        ],
+      ),
     );
   }
 }

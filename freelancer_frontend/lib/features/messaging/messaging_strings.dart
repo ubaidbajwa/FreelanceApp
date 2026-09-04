@@ -121,6 +121,7 @@ class MessagingStrings {
   static const actionReply = 'Reply';
   static const replyYou = 'You';
   static const replyPhoto = 'Photo';
+  static const replyVideo = 'Video';
   static const replyFile = 'File';
   static const replyVoice = 'Voice message';
   static const replyDeletedQuote = 'Original message deleted';
@@ -176,6 +177,20 @@ class MessagingStrings {
       'The new pin will replace the oldest one.';
   static const pinReplaceContinue = 'Continue';
 
+  // ── Reactions (F-M7) ─────────────────────────────────────────────────────────
+  // Full-picker (bottom sheet) title + the bar's "+" tooltip that opens it.
+  static const reactionPickerTitle = 'React';
+  static const reactionMoreTooltip = 'More reactions';
+  // Semantic label for a quick-bar emoji button (screen readers). Emoji injected.
+  static String reactWith(String emoji) => 'React with $emoji';
+  // Curated picker category headers (Option B grid — no search/skin-tone slice).
+  static const reactionCatSmileys = 'Smileys & Emotion';
+  static const reactionCatGestures = 'People & Gestures';
+  static const reactionCatHearts = 'Hearts & Symbols';
+  static const reactionCatAnimals = 'Animals & Nature';
+  static const reactionCatFood = 'Food & Drink';
+  static const reactionCatActivities = 'Activities & Objects';
+
   // ── System messages (M3) ─────────────────────────────────────────────────────
   // body hamesha khali aati hai — sentence yahan banti hai (per-viewer + baad mein
   // translatable). "You" jab caller khud actor ho, warna doosre ka naam.
@@ -183,4 +198,88 @@ class MessagingStrings {
   static const systemYouUnpinned = 'You unpinned a message';
   static String systemOtherPinned(String name) => '$name pinned a message';
   static String systemOtherUnpinned(String name) => '$name unpinned a message';
+
+  // ── Media messaging (F-M5) ─────────────────────────────────────────────────────
+
+  // Composer attachment button + the sheet it opens (Gallery / Camera only —
+  // Documents deliberately omitted this slice; a dead option is a false affordance).
+  static const attachTooltip = 'Attach';
+  static const attachGallery = 'Gallery';
+  static const attachCamera = 'Camera';
+
+  // Server-authoritative media limits, mirrored client-side to fail fast BEFORE a
+  // slow upload (see MediaLimits in message_actions.dart). The MB / seconds numbers
+  // below mirror those constants; the server re-checks and is the source of truth.
+  static const mediaImageMaxMb = 10;
+  static const mediaVideoMaxMb = 50;
+  static const mediaVideoMaxSeconds = 120;
+  static String mediaImageTooLarge() =>
+      'This photo is over the ${formatCount(mediaImageMaxMb)} MB limit.';
+  static String mediaVideoTooLarge() =>
+      'This video is over the ${formatCount(mediaVideoMaxMb)} MB limit.';
+  static const mediaUnsupportedType =
+      "That file type isn't supported. Choose a photo or video.";
+
+  // Preview + caption screen (shown after picking, before sending).
+  static const mediaCaptionHint = 'Add a caption…';
+  static const mediaSendTooltip = 'Send';
+  static const mediaPlayTooltip = 'Play';
+
+  // Permission denied (camera or photo library). Not a silent dead button — we
+  // explain what's needed and offer a way to the system settings.
+  static const permissionCameraTitle = 'Camera access needed';
+  static const permissionCameraBody =
+      'Allow camera access in Settings to take photos and videos.';
+  static const permissionPhotosTitle = 'Photo access needed';
+  static const permissionPhotosBody =
+      'Allow photo access in Settings to share photos and videos.';
+  static const permissionOpenSettings = 'Open Settings';
+  static const permissionDismiss = 'Not now';
+
+  // Bubble + viewer load/failure affordances (thumbnail or full asset).
+  static const mediaLoadFailed = "Couldn't load media";
+  static const mediaTapToRetry = 'Tap to retry';
+
+  // Conversation-list preview for an uncaptioned media message (the server sends
+  // no label — resolveConversationPreview picks these). "Photo"/"Video" reuse the
+  // reply strings above so the two surfaces never drift.
+  static const listPhoto = replyPhoto;
+  static const listVideo = replyVideo;
+
+  // ── Voice notes (F-M11) ────────────────────────────────────────────────────────
+
+  // Mic button (shown when the composer is empty) + recording UI.
+  static const voiceRecordTooltip = 'Record a voice message';
+  static const voiceSlideToCancel = 'Slide to cancel';
+  // Shown briefly when a hold is released under 1 second (accidental tap).
+  static const voiceHoldHint = 'Hold to record, release to send';
+
+  // Locked-mode controls (labels/icons reflect current state).
+  static const voiceDelete = 'Delete recording';
+  static const voicePause = 'Pause';
+  static const voiceResume = 'Resume';
+  static const voiceSend = 'Send';
+
+  // Microphone permission (Android RECORD_AUDIO / iOS mic). Not a dead button —
+  // explain and offer settings (reuses permissionOpenSettings / permissionDismiss).
+  static const permissionMicTitle = 'Microphone access needed';
+  static const permissionMicBody =
+      'Allow microphone access in Settings to record voice messages.';
+
+  // Recording interrupted because another app (e.g. a phone call) took the mic.
+  static const voiceMicBusy =
+      'Recording stopped — the microphone is in use by another app.';
+
+  // Server 300 s cap, mirrored for the auto-stop. Rejection message if it slips past.
+  static const voiceMaxSeconds = 300;
+  static String voiceTooLong() =>
+      'Voice messages can be up to ${formatCount(voiceMaxSeconds ~/ 60)} minutes.';
+
+  // The localised label the server never sends — used in reply previews, forwards,
+  // and the conversation list for a voice note. Reuses replyVoice so nothing drifts.
+  static const listVoice = replyVoice;
+
+  // Voice bubble playback semantics.
+  static const voicePlay = 'Play voice message';
+  static const voicePlaybackPause = 'Pause voice message';
 }

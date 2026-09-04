@@ -1,4 +1,17 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- F-M5 media messaging: camera capture + gallery pick (image_picker).
+         CAMERA drives system-camera capture; the feature is declared not-required so
+         the app still installs on camera-less devices (gallery still works there).
+         Storage: API <= 32 needs READ_EXTERNAL_STORAGE (capped with maxSdkVersion);
+         API 33+ uses the scoped photo/video media permissions instead. -->
+    <uses-permission android:name="android.permission.CAMERA"/>
+    <!-- F-M11 voice notes: record_audio for the recorder. -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO"/>
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"
+        android:maxSdkVersion="32"/>
+    <uses-permission android:name="android.permission.READ_MEDIA_IMAGES"/>
+    <uses-permission android:name="android.permission.READ_MEDIA_VIDEO"/>
+    <uses-feature android:name="android.hardware.camera" android:required="false"/>
     <application
         android:usesCleartextTraffic="true"
         android:label="Skillora"

@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import '../../../../core/presentation/widgets/user_avatar.dart';
 import '../../../../core/utils/number_format.dart';
 import '../../../../core/utils/relative_time.dart';
+import '../../application/message_actions.dart';
 import '../../data/models/messaging_models.dart';
 import '../../messaging_strings.dart';
 
@@ -24,7 +25,21 @@ class ConversationTile extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final unread = summary.unreadCount > 0;
-    final preview = summary.lastMessagePreview ?? MessagingStrings.noMessagesYet;
+    // F-M5: caption/text wins; an uncaptioned photo/video resolves to a localised
+    // "Photo"/"Video" (pure fn), with a small leading icon added below.
+    final preview = resolveConversationPreview(summary);
+    // Show the icon ONLY when the preview IS the media label (no caption/text) —
+    // a captioned media message reads as its caption, no icon.
+    final showMediaIcon = (summary.lastMessagePreview == null ||
+            summary.lastMessagePreview!.isEmpty) &&
+        (summary.lastMessageType == MessageType.image ||
+            summary.lastMessageType == MessageType.video ||
+            summary.lastMessageType == MessageType.voice);
+    final mediaIcon = switch (summary.lastMessageType) {
+      MessageType.video => Icons.videocam_rounded,
+      MessageType.voice => Icons.mic_rounded,
+      _ => Icons.photo_rounded,
+    };
 
     return Material(
       color: Colors.white,
@@ -64,16 +79,34 @@ class ConversationTile extends StatelessWidget {
                       ),
                     ),
                     const SizedBox(height: 3),
-                    Text(
-                      preview,
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      textAlign: TextAlign.start,
-                      style: TextStyle(
-                        fontSize: 13,
-                        color: unread ? _navy : _navy.withValues(alpha: 0.55),
-                        fontWeight: unread ? FontWeight.w600 : FontWeight.w400,
-                      ),
+                    Row(
+                      children: [
+                        if (showMediaIcon) ...[
+                          Icon(
+                            mediaIcon,
+                            size: 14,
+                            color:
+                                unread ? _navy : _navy.withValues(alpha: 0.55),
+                          ),
+                          const SizedBox(width: 4),
+                        ],
+                        Expanded(
+                          child: Text(
+                            preview,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            textAlign: TextAlign.start,
+                            style: TextStyle(
+                              fontSize: 13,
+                              color: unread
+                                  ? _navy
+                                  : _navy.withValues(alpha: 0.55),
+                              fontWeight:
+                                  unread ? FontWeight.w600 : FontWeight.w400,
+                            ),
+                          ),
+                        ),
+                      ],
                     ),
                   ],
                 ),

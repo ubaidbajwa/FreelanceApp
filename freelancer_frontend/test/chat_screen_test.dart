@@ -10,6 +10,7 @@
 
 import 'dart:async';
 
+import 'package:dio/dio.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -90,6 +91,15 @@ class _FakeRepo implements MessagingRepository {
   @override
   Future<Message> sendMessage(String conversationId, String body,
           {String? replyToMessageId}) =>
+      Future.error(UnimplementedError());
+
+  @override
+  Future<Message> sendMediaMessage(String conversationId, String filePath,
+          {String? caption,
+          String? replyToMessageId,
+          String? waveform,
+          void Function(int, int)? onSendProgress,
+          CancelToken? cancelToken}) =>
       Future.error(UnimplementedError());
 
   @override

@@ -133,6 +133,8 @@ class SignalRRealtimeClient implements RealtimeClient {
       'MessagePinChanged',
       'MessageEdited',
       'ReactionChanged',
+      // M4 — read receipts: fires to the OTHER participant with the new watermark.
+      'ConversationRead',
     ]) {
       hub.on(event, _makeInvocationFunc(event));
     }

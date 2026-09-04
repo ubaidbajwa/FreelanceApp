@@ -45,6 +45,12 @@ dependencies:
   intl: ^0.20.0
   signalr_netcore: ^1.4.4
   logging: ^1.3.0
+  video_player: ^2.14.0 # F-M5 video bubble + full-screen player (Flutter-team maintained)
+  cached_network_image: ^3.4.1 # F-M5 thumbnail caching — scroll past a photo bina re-download
+  app_settings: ^9.0.0 # F-M5 permission flow — deep-link to OS settings on denied camera/photo access
+  record: ^7.1.1 # F-M11 voice notes — recording + amplitude stream for the waveform
+  just_audio: ^0.10.6 # F-M11 voice playback — position stream + seeking
+  path_provider: ^2.1.6 # F-M11 temp dir for the recorded voice file before upload
 
 dev_dependencies:
   flutter_test:

@@ -13,6 +13,7 @@
 
 import 'dart:async';
 
+import 'package:dio/dio.dart';
 import 'package:fake_async/fake_async.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -46,12 +47,19 @@ class _FakeRealtimeClient implements RealtimeClient {
   }
 
   void emitState(RealtimeConnectionState s) => _stateCtrl.add(s);
+  void emitEvent(RealtimeEvent e) => _eventsCtrl.add(e);
 }
 
 // Queue-based fake — enqueue futures before they're needed.
 class _FakeRepo implements MessagingRepository {
   final _msgQueue = <Future<MessagePage>>[];
   int getMessagesCallCount = 0;
+
+  // ── F-M7 reaction controls ────────────────────────────────────────────────
+  int reactCallCount = 0;
+  int removeCallCount = 0;
+  bool reactShouldFail = false; // next react/remove throws
+  Completer<List<MessageReaction>>? reactGate; // hold react in flight if set
 
   void enqueue(Future<MessagePage> f) => _msgQueue.add(f);
 
@@ -98,6 +106,15 @@ class _FakeRepo implements MessagingRepository {
       Future.error(UnimplementedError());
 
   @override
+  Future<Message> sendMediaMessage(String conversationId, String filePath,
+          {String? caption,
+          String? replyToMessageId,
+          String? waveform,
+          void Function(int, int)? onSendProgress,
+          CancelToken? cancelToken}) =>
+      Future.error(UnimplementedError());
+
+  @override
   Future<void> acceptConversation(String conversationId) async {}
 
   @override
@@ -118,9 +135,19 @@ class _FakeRepo implements MessagingRepository {
   @override
   Future<List<Message>> getPinnedMessages(String c) async => [];
   @override
-  Future<List<MessageReaction>> reactToMessage(String c, String m, String e) async => [];
+  Future<List<MessageReaction>> reactToMessage(String c, String m, String e) async {
+    reactCallCount++;
+    if (reactShouldFail) throw Exception('react failed');
+    if (reactGate != null) return reactGate!.future;
+    // Server returns the caller-relative aggregate: the caller now owns this emoji.
+    return [MessageReaction(emoji: e, count: 1, reactedByMe: true)];
+  }
+
   @override
-  Future<void> removeReaction(String c, String m) async {}
+  Future<void> removeReaction(String c, String m) async {
+    removeCallCount++;
+    if (reactShouldFail) throw Exception('remove failed');
+  }
   @override
   Future<Message> editMessage(String c, String m, String b) =>
       Future.error(UnimplementedError());
@@ -133,12 +160,14 @@ class _FakeRepo implements MessagingRepository {
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
-ConversationSummary _summary({int unreadCount = 0}) => ConversationSummary(
+ConversationSummary _summary({int unreadCount = 0, DateTime? otherLastReadAt}) =>
+    ConversationSummary(
       id: 'conv1',
       status: ConversationStatus.accepted,
       isRequest: false,
       otherUser: const ConversationUser(userId: 'u2', fullName: 'Test User'),
       unreadCount: unreadCount,
+      otherLastReadAt: otherLastReadAt,
     );
 
 Message _msg(String id) => Message(
@@ -427,6 +456,225 @@ void main() {
               'touch isLoading');
 
       container.dispose();
+    });
+  });
+
+  // ── M4: ConversationRead read-receipt watermark ────────────────────────────
+  group('ConversationRead (M4 read receipts)', () {
+    RealtimeEvent readEvent(String convId, DateTime lastReadAt) =>
+        RealtimeEvent('ConversationRead', {
+          'conversationId': convId,
+          'lastReadAt': lastReadAt.toIso8601String(),
+        });
+
+    test('8. seeds otherLastReadAt from the summary on open', () async {
+      final repo = _FakeRepo();
+      repo.enqueue(Future.value(_page([_msg('m1')])));
+      final container = _makeContainer(repo);
+      container.listen(chatProvider, (_, _) {});
+      addTearDown(container.dispose);
+
+      final watermark = DateTime.utc(2026, 8, 31, 12);
+      container.read(chatProvider.notifier).open(
+            conversationId: 'conv1',
+            summary: _summary(otherLastReadAt: watermark),
+          );
+      await Future<void>.delayed(Duration.zero);
+
+      expect(container.read(chatProvider).otherLastReadAt, watermark,
+          reason: 'hot-open seeds the watermark from the summary');
+    });
+
+    test('9. event for the open conversation advances the watermark', () async {
+      final repo = _FakeRepo();
+      repo.enqueue(Future.value(_page([_msg('m1')])));
+      final client = _FakeRealtimeClient();
+      final container = _makeContainer(repo, client: client);
+      container.listen(chatProvider, (_, _) {});
+      addTearDown(container.dispose);
+
+      container.read(chatProvider.notifier).open(
+          conversationId: 'conv1', summary: _summary());
+      await Future<void>.delayed(Duration.zero);
+      expect(container.read(chatProvider).otherLastReadAt, isNull);
+
+      final ts = DateTime.utc(2026, 8, 31, 12);
+      client.emitEvent(readEvent('conv1', ts));
+      await Future<void>.delayed(Duration.zero);
+
+      expect(container.read(chatProvider).otherLastReadAt, ts,
+          reason: 'event for the open chat advances the watermark');
+    });
+
+    test('10. event for a DIFFERENT conversation is ignored', () async {
+      final repo = _FakeRepo();
+      repo.enqueue(Future.value(_page([_msg('m1')])));
+      final client = _FakeRealtimeClient();
+      final container = _makeContainer(repo, client: client);
+      container.listen(chatProvider, (_, _) {});
+      addTearDown(container.dispose);
+
+      container.read(chatProvider.notifier).open(
+          conversationId: 'conv1', summary: _summary());
+      await Future<void>.delayed(Duration.zero);
+
+      client.emitEvent(readEvent('other-conv', DateTime.utc(2026, 8, 31, 12)));
+      await Future<void>.delayed(Duration.zero);
+
+      expect(container.read(chatProvider).otherLastReadAt, isNull,
+          reason: 'a read on another conversation must not touch this one');
+    });
+
+    test('11. out-of-order (older) event never moves the watermark backwards',
+        () async {
+      final repo = _FakeRepo();
+      repo.enqueue(Future.value(_page([_msg('m1')])));
+      final client = _FakeRealtimeClient();
+      final container = _makeContainer(repo, client: client);
+      container.listen(chatProvider, (_, _) {});
+      addTearDown(container.dispose);
+
+      final newer = DateTime.utc(2026, 8, 31, 12);
+      container.read(chatProvider.notifier).open(
+            conversationId: 'conv1',
+            summary: _summary(otherLastReadAt: newer),
+          );
+      await Future<void>.delayed(Duration.zero);
+      expect(container.read(chatProvider).otherLastReadAt, newer);
+
+      // A stale event carrying an OLDER timestamp arrives late.
+      client.emitEvent(readEvent('conv1', DateTime.utc(2026, 8, 31, 11)));
+      await Future<void>.delayed(Duration.zero);
+
+      expect(container.read(chatProvider).otherLastReadAt, newer,
+          reason: 'a tick must never flip read → sent on a reordered event');
+    });
+  });
+
+  // ── F-M7: reactions (optimistic + event merge) ─────────────────────────────
+  group('reactions', () {
+    test('12. reacting adds optimistically then reconciles the server aggregate',
+        () async {
+      final repo = _FakeRepo();
+      repo.enqueue(Future.value(_page([_msg('m1')])));
+      final container = _makeContainer(repo);
+      container.listen(chatProvider, (_, _) {});
+      addTearDown(container.dispose);
+      final notifier = container.read(chatProvider.notifier);
+      notifier.open(conversationId: 'conv1', summary: _summary());
+      await Future<void>.delayed(Duration.zero);
+
+      final err = await notifier.toggleReaction('m1', '👍');
+      expect(err, isNull);
+      final msg =
+          container.read(chatProvider).messages.firstWhere((m) => m.id == 'm1');
+      expect(msg.myReactionEmoji, '👍');
+      final b = msg.reactions.firstWhere((r) => r.emoji == '👍');
+      expect(b.count, 1);
+      expect(b.reactedByMe, isTrue);
+      expect(repo.reactCallCount, 1);
+    });
+
+    test('13. a failed reaction rolls back to the previous state and returns an error',
+        () async {
+      final repo = _FakeRepo()..reactShouldFail = true;
+      repo.enqueue(Future.value(_page([_msg('m1')])));
+      final container = _makeContainer(repo);
+      container.listen(chatProvider, (_, _) {});
+      addTearDown(container.dispose);
+      final notifier = container.read(chatProvider.notifier);
+      notifier.open(conversationId: 'conv1', summary: _summary());
+      await Future<void>.delayed(Duration.zero);
+
+      final err = await notifier.toggleReaction('m1', '👍');
+      expect(err, isNotNull, reason: 'failure surfaces a user-facing message');
+      final msg =
+          container.read(chatProvider).messages.firstWhere((m) => m.id == 'm1');
+      expect(msg.myReactionEmoji, isNull, reason: 'rolled back');
+      expect(msg.reactions, isEmpty,
+          reason: 'the optimistic bucket is removed on rollback');
+    });
+
+    test('14. a second tap while a call is in flight is dropped (one call only)',
+        () async {
+      final repo = _FakeRepo()..reactGate = Completer<List<MessageReaction>>();
+      repo.enqueue(Future.value(_page([_msg('m1')])));
+      final container = _makeContainer(repo);
+      container.listen(chatProvider, (_, _) {});
+      addTearDown(container.dispose);
+      final notifier = container.read(chatProvider.notifier);
+      notifier.open(conversationId: 'conv1', summary: _summary());
+      await Future<void>.delayed(Duration.zero);
+
+      final f1 = notifier.toggleReaction('m1', '👍'); // gated, in flight
+      await Future<void>.delayed(Duration.zero);
+      final second = await notifier.toggleReaction('m1', '❤️'); // dropped
+      expect(second, isNull);
+      expect(repo.reactCallCount, 1,
+          reason: 'a double-tap must not spawn a second in-flight call');
+
+      repo.reactGate!
+          .complete([MessageReaction(emoji: '👍', count: 1, reactedByMe: true)]);
+      await f1;
+    });
+
+    test('15. ReactionChanged merges counts but preserves the caller reactedByMe',
+        () async {
+      final repo = _FakeRepo();
+      repo.enqueue(Future.value(_page([_msg('m1')])));
+      final client = _FakeRealtimeClient();
+      final container = _makeContainer(repo, client: client);
+      container.listen(chatProvider, (_, _) {});
+      addTearDown(container.dispose);
+      final notifier = container.read(chatProvider.notifier);
+      notifier.open(conversationId: 'conv1', summary: _summary());
+      await Future<void>.delayed(Duration.zero);
+
+      await notifier.toggleReaction('m1', '👍'); // caller now owns 👍
+
+      // Event: 👍 climbs to 2 (someone else), reactedByMe STRIPPED to false.
+      client.emitEvent(RealtimeEvent('ReactionChanged', {
+        'conversationId': 'conv1',
+        'messageId': 'm1',
+        'reactions': [
+          {'emoji': '👍', 'count': 2, 'reactedByMe': false},
+        ],
+      }));
+      await Future<void>.delayed(Duration.zero);
+
+      final msg =
+          container.read(chatProvider).messages.firstWhere((m) => m.id == 'm1');
+      final b = msg.reactions.firstWhere((r) => r.emoji == '👍');
+      expect(b.count, 2, reason: 'server count is authoritative');
+      expect(b.reactedByMe, isTrue,
+          reason: 're-derived from myReactionEmoji, never from the stripped event');
+    });
+
+    test('16. ReactionChanged for a message not in local state is ignored',
+        () async {
+      final repo = _FakeRepo();
+      repo.enqueue(Future.value(_page([_msg('m1')])));
+      final client = _FakeRealtimeClient();
+      final container = _makeContainer(repo, client: client);
+      container.listen(chatProvider, (_, _) {});
+      addTearDown(container.dispose);
+      final notifier = container.read(chatProvider.notifier);
+      notifier.open(conversationId: 'conv1', summary: _summary());
+      await Future<void>.delayed(Duration.zero);
+
+      client.emitEvent(RealtimeEvent('ReactionChanged', {
+        'conversationId': 'conv1',
+        'messageId': 'ghost',
+        'reactions': [
+          {'emoji': '👍', 'count': 1, 'reactedByMe': false},
+        ],
+      }));
+      await Future<void>.delayed(Duration.zero);
+
+      final msg =
+          container.read(chatProvider).messages.firstWhere((m) => m.id == 'm1');
+      expect(msg.reactions, isEmpty,
+          reason: 'an event for another message must not touch this one');
     });
   });
 }

@@ -1,5 +1,6 @@
 import 'package:dio/dio.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:http_parser/http_parser.dart';
 
 import '../../../core/models/paged_result.dart';
 import '../../../core/network/dio_client.dart';
@@ -86,6 +87,67 @@ class MessagingRepository {
       },
     );
     return Message.fromJson(response.data as Map<String, dynamic>);
+  }
+
+  // 5b. Media message bhejo (F-M5) — multipart, EK request mein Cloudinary upload +
+  //     message create (backend 201 ke sath bana message wapas). Form field naam
+  //     backend SendMediaMessageApiRequest se exactly match karte hain: File /
+  //     Caption / ReplyToMessageId (ASP.NET FromForm case-insensitive, magar exact
+  //     PascalCase safe rehta hai).
+  //
+  //     onSendProgress dio se aata hai — asli byte-level progress (50 MB upload pe
+  //     ek fake spinner bekaar hai). CancelToken caller retry/dispose pe abort ke
+  //     liye. contentType client set karta hai (dio default octet-stream deta,
+  //     backend sirf image/*|video/* leta — magar server magic-bytes se bhi verify
+  //     karta, is liye yeh sirf sahi header ke liye hai).
+  Future<Message> sendMediaMessage(
+    String conversationId,
+    String filePath, {
+    String? caption,
+    String? replyToMessageId,
+    String? waveform, // F-M11 voice — comma-separated 0–100 samples (≤64) ya null
+    void Function(int sent, int total)? onSendProgress,
+    CancelToken? cancelToken,
+  }) async {
+    final formData = FormData.fromMap({
+      'File': await MultipartFile.fromFile(
+        filePath,
+        contentType: _mediaContentType(filePath),
+      ),
+      // Khali/null caption include nahi — backend Caption ko optional maanta hai.
+      if (caption != null && caption.isNotEmpty) 'Caption': caption,
+      'ReplyToMessageId': ?replyToMessageId,
+      // Waveform null ho to bhejte hi nahi — server null ko valid maanta (flat bar).
+      'Waveform': ?waveform,
+    });
+    final response = await _dio.post(
+      '/api/conversations/$conversationId/messages/media',
+      data: formData,
+      onSendProgress: onSendProgress,
+      cancelToken: cancelToken,
+    );
+    return Message.fromJson(response.data as Map<String, dynamic>);
+  }
+
+  // File extension → MIME. Server-side list (ChatService): images jpeg/png/webp/gif,
+  // videos mp4/webm/quicktime, voice m4a/aac (audio/mp4|aac), opus/ogg (audio/ogg).
+  // Unknown → octet-stream (server saaf 400 dega). Note: .webm yahan video maana
+  // jata hai (picked video ke liye) — voice recording hamesha .m4a produce karti.
+  MediaType _mediaContentType(String filePath) {
+    final ext = filePath.split('.').last.toLowerCase();
+    return switch (ext) {
+      'jpg' || 'jpeg' => MediaType('image', 'jpeg'),
+      'png' => MediaType('image', 'png'),
+      'webp' => MediaType('image', 'webp'),
+      'gif' => MediaType('image', 'gif'),
+      'mp4' => MediaType('video', 'mp4'),
+      'webm' => MediaType('video', 'webm'),
+      'mov' || 'qt' => MediaType('video', 'quicktime'),
+      'm4a' => MediaType('audio', 'mp4'), // F-M11 aacLc recording
+      'aac' => MediaType('audio', 'aac'),
+      'opus' || 'ogg' => MediaType('audio', 'ogg'),
+      _ => MediaType('application', 'octet-stream'),
+    };
   }
 
   // 6. Request accept karo — 204 NoContent

@@ -34,16 +34,22 @@ class ProfileSummaryState {
     String? photoUrl,
     int? completionPercent,
     int? role,
-  }) =>
-      ProfileSummaryState(
-        loading: loading ?? this.loading,
-        error: clearError ? null : (error ?? this.error),
-        displayName: displayName ?? this.displayName,
-        headline: headline ?? this.headline,
-        photoUrl: photoUrl ?? this.photoUrl,
-        completionPercent: completionPercent ?? this.completionPercent,
-        role: role ?? this.role,
-      );
+  }) => ProfileSummaryState(
+    loading: loading ?? this.loading,
+    error: clearError ? null : (error ?? this.error),
+    displayName: displayName ?? this.displayName,
+    headline: headline ?? this.headline,
+    photoUrl: photoUrl ?? this.photoUrl,
+    completionPercent: completionPercent ?? this.completionPercent,
+    role: role ?? this.role,
+  );
+}
+
+class _ProfileJwtClaims {
+  final int role;
+  final String? fullName;
+
+  const _ProfileJwtClaims({required this.role, this.fullName});
 }
 
 class ProfileSummaryNotifier extends Notifier<ProfileSummaryState> {
@@ -54,39 +60,56 @@ class ProfileSummaryNotifier extends Notifier<ProfileSummaryState> {
   }
 
   Future<void> load() async {
-    state = state.copyWith(loading: true, clearError: true);
+    final claims = await _claimsFromJwt();
+    final jwtName = claims.fullName;
+    final fallbackName = (jwtName != null && jwtName.isNotEmpty)
+        ? jwtName
+        : state.displayName;
+    state = state.copyWith(
+      loading: true,
+      clearError: true,
+      displayName: fallbackName,
+      role: claims.role,
+    );
     try {
-      final role = await _roleFromJwt();
       final profile = await ref.read(profileRepositoryProvider).getMyProfile();
+      final profileName = profile.displayName;
       state = ProfileSummaryState(
-        displayName: profile.displayName ?? '',
+        displayName: (profileName != null && profileName.isNotEmpty)
+            ? profileName
+            : fallbackName,
         headline: profile.headline,
         photoUrl: profile.profilePhotoUrl,
         completionPercent: profile.profileCompletionPercent,
-        role: role,
+        role: claims.role,
       );
     } catch (_) {
       state = state.copyWith(loading: false, error: 'Could not load profile');
     }
   }
 
-  // JWT payload mein primary_role claim hota hai ("0" ya "1" as string)
-  Future<int> _roleFromJwt() async {
+  // JWT payload mein primary_role ("0"/"1") aur full_name fallback hota hai.
+  Future<_ProfileJwtClaims> _claimsFromJwt() async {
     try {
       final token = await ref.read(secureStorageProvider).getAccessToken();
-      if (token == null) return 0;
+      if (token == null) return const _ProfileJwtClaims(role: 0);
       final parts = token.split('.');
-      if (parts.length != 3) return 0;
-      final payload = utf8.decode(base64Url.decode(base64Url.normalize(parts[1])));
+      if (parts.length != 3) return const _ProfileJwtClaims(role: 0);
+      final payload = utf8.decode(
+        base64Url.decode(base64Url.normalize(parts[1])),
+      );
       final data = jsonDecode(payload) as Map<String, dynamic>;
-      return int.tryParse((data['primary_role'] as String?) ?? '0') ?? 0;
+      return _ProfileJwtClaims(
+        role: int.tryParse((data['primary_role'] as String?) ?? '0') ?? 0,
+        fullName: data['full_name'] as String?,
+      );
     } catch (_) {
-      return 0;
+      return const _ProfileJwtClaims(role: 0);
     }
   }
 }
 
 final profileSummaryProvider =
     NotifierProvider<ProfileSummaryNotifier, ProfileSummaryState>(
-  ProfileSummaryNotifier.new,
-);
+      ProfileSummaryNotifier.new,
+    );

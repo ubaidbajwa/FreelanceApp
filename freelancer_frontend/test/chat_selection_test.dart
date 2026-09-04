@@ -132,6 +132,14 @@ class _FakeRepo implements MessagingRepository {
           {String? replyToMessageId}) =>
       Future.error(UnimplementedError());
   @override
+  Future<Message> sendMediaMessage(String c, String filePath,
+          {String? caption,
+          String? replyToMessageId,
+          String? waveform,
+          void Function(int, int)? onSendProgress,
+          CancelToken? cancelToken}) =>
+      Future.error(UnimplementedError());
+  @override
   Future<void> acceptConversation(String c) async {}
   @override
   Future<void> declineConversation(String c) async {}

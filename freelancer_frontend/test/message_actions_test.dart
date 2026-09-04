@@ -20,6 +20,7 @@ ChatMessage _m({
   bool isDeleted = false,
   bool isPinned = false,
   DateTime? createdAt,
+  ChatSendStatus status = ChatSendStatus.confirmed,
 }) =>
     ChatMessage(
       id: id,
@@ -27,7 +28,7 @@ ChatMessage _m({
       body: 'body',
       type: type,
       createdAt: createdAt ?? DateTime.utc(2026, 1, 1),
-      status: ChatSendStatus.confirmed,
+      status: status,
       isMine: isMine,
       isDeleted: isDeleted,
       isPinned: isPinned,
@@ -399,6 +400,222 @@ void main() {
       final s = resolvePinSegments(0, 0);
       expect(s.count, 0);
       expect(s.activeIndex, 0);
+    });
+  });
+
+  // ── M4: resolveTickState (read receipts) ──────────────────────────────────────
+  // Three states only: none / sent (single ✓) / read (double ✓✓). No "delivered".
+  // A message is read when createdAt <= otherLastReadAt, compared in UTC. Ticks
+  // render on the caller's OWN confirmed messages only — never on the other
+  // person's, system notices, tombstones, or optimistic (pending/failed) bubbles.
+  group('resolveTickState', () {
+    // Fixed watermark instant used across cases (UTC).
+    final watermark = DateTime.utc(2026, 8, 31, 12, 0, 0);
+
+    test("other's message → none (ticks are own-only)", () {
+      final s = resolveTickState(
+        _m(isMine: false, createdAt: watermark.subtract(const Duration(hours: 1))),
+        watermark,
+      );
+      expect(s, TickState.none);
+    });
+
+    test('system message → none (never on system notices)', () {
+      final s = resolveTickState(
+        _m(isMine: true, type: MessageType.system, createdAt: watermark),
+        watermark,
+      );
+      expect(s, TickState.none);
+    });
+
+    test('tombstone (deleted) → none', () {
+      final s = resolveTickState(
+        _m(isMine: true, isDeleted: true, createdAt: watermark),
+        watermark,
+      );
+      expect(s, TickState.none);
+    });
+
+    test('pending optimistic bubble → none (keeps its clock)', () {
+      final s = resolveTickState(
+        _m(isMine: true, status: ChatSendStatus.pending, createdAt: watermark),
+        watermark,
+      );
+      expect(s, TickState.none);
+    });
+
+    test('failed send → none (keeps its retry affordance)', () {
+      final s = resolveTickState(
+        _m(isMine: true, status: ChatSendStatus.failed, createdAt: watermark),
+        watermark,
+      );
+      expect(s, TickState.none);
+    });
+
+    test('own confirmed, otherLastReadAt null → sent (nothing read yet)', () {
+      final s = resolveTickState(_m(isMine: true, createdAt: watermark), null);
+      expect(s, TickState.sent);
+    });
+
+    test('own confirmed, created before watermark → read', () {
+      final s = resolveTickState(
+        _m(isMine: true, createdAt: watermark.subtract(const Duration(minutes: 1))),
+        watermark,
+      );
+      expect(s, TickState.read);
+    });
+
+    test('own confirmed, created after watermark → sent', () {
+      final s = resolveTickState(
+        _m(isMine: true, createdAt: watermark.add(const Duration(minutes: 1))),
+        watermark,
+      );
+      expect(s, TickState.sent);
+    });
+
+    test('BOUNDARY: createdAt exactly equals watermark → read (inclusive)', () {
+      final s = resolveTickState(_m(isMine: true, createdAt: watermark), watermark);
+      expect(s, TickState.read,
+          reason: 'createdAt <= otherLastReadAt is read; the boundary counts');
+    });
+
+    test('comparison is by instant, not wall-clock: a local-zone createdAt at the '
+        'same instant as a UTC watermark is still read', () {
+      // Same absolute instant expressed two ways. If the function ever compared
+      // wall-clock components after a .toLocal(), this would flip for non-UTC
+      // machines. Instant comparison keeps it correct everywhere.
+      final createdLocal = watermark.toLocal();
+      final s = resolveTickState(_m(isMine: true, createdAt: createdLocal), watermark);
+      expect(s, TickState.read);
+    });
+  });
+
+  // ── F-M7: reactions ───────────────────────────────────────────────────────────
+
+  // Build a reaction bucket. `mine` = reactedByMe (caller-relative display flag).
+  MessageReaction mkReaction(String emoji, int count, {bool mine = false}) =>
+      MessageReaction(emoji: emoji, count: count, reactedByMe: mine);
+
+  MessageReaction? findReaction(List<MessageReaction> rs, String emoji) {
+    for (final r in rs) {
+      if (r.emoji == emoji) return r;
+    }
+    return null;
+  }
+
+  // Part 1 — the reaction bar is a SINGLE-selection affordance and must never be
+  // reachable for a system notice or a tombstone (those cannot be selected at all).
+  group('shouldShowReactionBar', () {
+    test('exactly one normal message selected → true', () {
+      expect(shouldShowReactionBar([_m(id: '1')]), isTrue);
+    });
+
+    test('own message selected → true (no isMine restriction)', () {
+      expect(shouldShowReactionBar([_m(id: '1', isMine: true)]), isTrue);
+    });
+
+    test('two messages selected → false (react-to-many is not a thing)', () {
+      expect(shouldShowReactionBar([_m(id: '1'), _m(id: '2')]), isFalse);
+    });
+
+    test('empty selection → false', () {
+      expect(shouldShowReactionBar([]), isFalse);
+    });
+
+    test('single tombstone → false (cannot be reacted to)', () {
+      expect(shouldShowReactionBar([_m(id: '1', isDeleted: true)]), isFalse);
+    });
+
+    test('single system notice → false (cannot be reacted to)', () {
+      expect(
+        shouldShowReactionBar([_m(id: '1', type: MessageType.system)]),
+        isFalse,
+      );
+    });
+  });
+
+  // Part 3/4 — the optimistic toggle. One call covers add / remove / replace, and
+  // the local math must match what the backend's PUT does before the round trip.
+  group('applyReactionToggle', () {
+    test('no prior reaction, tap 👍 → new bucket count 1, mine, myEmoji 👍', () {
+      final s = applyReactionToggle(const [], null, '👍');
+      expect(s.myEmoji, '👍');
+      final b = findReaction(s.reactions, '👍')!;
+      expect(b.count, 1);
+      expect(b.reactedByMe, isTrue);
+    });
+
+    test('add 👍 where two others already reacted → count 3, mine', () {
+      final s = applyReactionToggle([mkReaction('👍', 2)], null, '👍');
+      expect(s.myEmoji, '👍');
+      expect(findReaction(s.reactions, '👍')!.count, 3);
+      expect(findReaction(s.reactions, '👍')!.reactedByMe, isTrue);
+    });
+
+    test('toggle OFF my only 👍 (count 1) → bucket removed, myEmoji null', () {
+      final s = applyReactionToggle([mkReaction('👍', 1, mine: true)], '👍', '👍');
+      expect(s.myEmoji, isNull);
+      expect(findReaction(s.reactions, '👍'), isNull);
+    });
+
+    test('toggle OFF my 👍 among 3 → count 2, no longer mine, myEmoji null', () {
+      final s = applyReactionToggle([mkReaction('👍', 3, mine: true)], '👍', '👍');
+      expect(s.myEmoji, isNull);
+      final b = findReaction(s.reactions, '👍')!;
+      expect(b.count, 2);
+      expect(b.reactedByMe, isFalse);
+    });
+
+    test('replace 👍 (mine, count 1) with ❤️ → 👍 removed, ❤️ new count 1 mine', () {
+      final s = applyReactionToggle([mkReaction('👍', 1, mine: true)], '👍', '❤️');
+      expect(s.myEmoji, '❤️');
+      expect(findReaction(s.reactions, '👍'), isNull);
+      expect(findReaction(s.reactions, '❤️')!.count, 1);
+      expect(findReaction(s.reactions, '❤️')!.reactedByMe, isTrue);
+    });
+
+    test('replace 👍 (mine, count 2) with existing ❤️ (count 1) → 👍 1 not-mine, ❤️ 2 mine', () {
+      final s = applyReactionToggle(
+        [mkReaction('👍', 2, mine: true), mkReaction('❤️', 1)],
+        '👍',
+        '❤️',
+      );
+      expect(s.myEmoji, '❤️');
+      expect(findReaction(s.reactions, '👍')!.count, 1);
+      expect(findReaction(s.reactions, '👍')!.reactedByMe, isFalse);
+      expect(findReaction(s.reactions, '❤️')!.count, 2);
+      expect(findReaction(s.reactions, '❤️')!.reactedByMe, isTrue);
+    });
+  });
+
+  // Part 5 — merging an incoming ReactionChanged. Counts are authoritative from the
+  // payload; reactedByMe is caller-relative and STRIPPED, so it must be re-derived
+  // from the caller's own tracked emoji — never from the event.
+  group('mergeReactionCounts', () {
+    test('caller reacted 👍; event says 👍 count 2 (someone else too) → 2, mine', () {
+      final merged = mergeReactionCounts([mkReaction('👍', 2)], '👍');
+      final b = findReaction(merged, '👍')!;
+      expect(b.count, 2);
+      expect(b.reactedByMe, isTrue,
+          reason: 'the event strips reactedByMe; re-derive it from myEmoji');
+    });
+
+    test('caller removed 👍 (myEmoji null) while event in flight → 👍 not mine', () {
+      final merged = mergeReactionCounts([mkReaction('👍', 2)], null);
+      expect(findReaction(merged, '👍')!.reactedByMe, isFalse);
+    });
+
+    test('event for an emoji the caller never used → that bucket not mine, own stays mine', () {
+      final merged = mergeReactionCounts([mkReaction('😂', 1), mkReaction('👍', 1)], '👍');
+      expect(findReaction(merged, '😂')!.reactedByMe, isFalse);
+      expect(findReaction(merged, '👍')!.reactedByMe, isTrue);
+    });
+
+    test('counts come straight from the payload (no double-count of an optimistic add)', () {
+      // The caller already applied 👍 optimistically (count included by server).
+      // The event carries the SAME authoritative count — merge must not add again.
+      final merged = mergeReactionCounts([mkReaction('👍', 1)], '👍');
+      expect(findReaction(merged, '👍')!.count, 1);
     });
   });
 }

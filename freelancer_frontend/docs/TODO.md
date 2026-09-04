@@ -35,3 +35,69 @@ is parsed and carried through `ChatMessage` and the `MessagePinChanged` event, b
 nothing renders it yet. A future slice could show a subtle "expires in …" hint in
 the pin banner or the bubble's pin indicator. Remember `.toLocal()` on render and
 that null must read as "no expiry", not "expired".
+## F-M7 — Reaction picker: search box
+
+The full emoji picker (curated grid, Option B) has NO search box this slice. With
+~130 emoji across six categories a search field is a reasonable follow-up. Add a
+TextField above the grid that filters the flattened emoji list; keep it under the
+navy/gold theme and route any label through messaging_strings.dart.
+
+## F-M7 — Reaction skin-tone selector
+
+No skin-tone selector this slice. The backend column is varchar(16) and already
+accepts multi-codepoint sequences (skin-tone modifiers, ZWJ), so this is purely a
+UI gap: a long-press on a gesture/person emoji could open a Fitzpatrick modifier
+row and send the composed sequence. No backend change is needed.
+
+## F-M7 — "Who reacted" list
+
+The reaction DTO is aggregate-only (emoji + count + reactedByMe); there is no
+per-user breakdown. Showing a "who reacted" sheet needs a new backend endpoint,
+so it is out of scope here.
+
+## F-M5 — Multi-select from the gallery
+
+`_pickFromGallery` uses `ImagePicker().pickMedia()` — a SINGLE image or video per
+pick. Sending several at once (WhatsApp-style multi-select with a shared caption)
+is a follow-up: switch to `pickMultipleMedia()`, show a horizontal strip of
+thumbnails on the preview screen, and fire `sendMedia` once per file (or a batched
+endpoint if the backend adds one). Keep the per-file client-side validation.
+
+## F-M5 — Camera video capture
+
+The Camera attachment option captures a PHOTO (`pickImage(source: camera)`). The
+full WhatsApp-style camera — hold-to-record video, tap for photo, flip camera — is
+F-M11 and will replace this entry point. Until then, a recorded video can still be
+sent by picking it from the gallery.
+
+## F-M5 — Crop & markup before sending
+
+The preview screen sends the picked image/video as-is. Cropping, rotating, and
+drawing/markup (arrows, text, blur) before sending are a later slice. They would
+slot into MediaPreviewScreen between the preview and the caption bar, editing a
+working copy of the file so the original is never mutated.
+
+## F-M5 — Swiping between media in the viewer
+
+MediaViewerScreen shows ONE asset. Swiping left/right through all the media in a
+conversation (a media gallery) is out of scope. It needs the viewer to take the
+ordered list of media messages + a starting index and drive a PageView, plus a
+per-page video-controller lifecycle so only the visible video holds a controller.
+
+## F-M11 — Voice note follow-ups
+
+Out of scope for this slice (deliberately):
+- Playback speed (1x/1.5x/2x) — just_audio supports setSpeed; add a small speed
+  toggle in the bubble that persists per-conversation.
+- "Played" receipts — the mic badge in VoiceBubble is wired for a future colour swap
+  (muted → gold) but the backend has no played flag yet. Needs a MessagePlay table on
+  the server with the same shape as MessageDeletion and MessageReaction (messageId,
+  userId, playedAt). Client reads it via the existing realtime/REST layer. Do NOT use
+  LastReadAt as a proxy — LastReadAt tracks when a conversation was opened, not whether
+  a specific audio file was played; they diverge whenever a message is read on another
+  device or via a notification preview.
+- Waveform scrubbing (drag the playhead dot) — out of scope. Implement via
+  GestureDetector.onHorizontalDragUpdate reusing the _onWaveformTap fraction mapping.
+  No CustomPainter change needed; the dot position already follows `progress`.
+- Transcription — a server/ML feature, no client hook exists.
+- Camera video capture / documents remain in their own slices (F-M12, later).
