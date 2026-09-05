@@ -586,6 +586,39 @@ String downsampleWaveform(List<int> samples, {int maxSamples = 64}) {
   return out.join(',');
 }
 
+// ── Played receipts (F-M11 M7) ────────────────────────────────────────────────
+
+// Whether to send a "played" receipt when the caller STARTS playing this note.
+// This is the client-side mirror of the server's guards (own note / non-voice /
+// tombstone all 400) plus idempotence (already played → pointless traffic). The
+// SERVER remains authoritative and re-checks all of it.
+//
+// NOTE: resume-after-pause is NOT a concern of this function — that is excluded at
+// the call site, which only invokes markPlayed on a fresh playback start (a paused
+// note is still "active" in the shared player). Here we only answer the four
+// content questions: own vs incoming, non-voice, tombstone, already-played.
+bool shouldMarkPlayed(ChatMessage m) {
+  if (m.isMine) return false; // own note → server 400; a receipt about myself is meaningless
+  if (m.type != MessageType.voice) return false; // played receipts are voice-only
+  if (m.isDeleted) return false; // tombstone → server 400
+  if (m.playedByMe) return false; // already marked → idempotent no-op, skip the call
+  return true;
+}
+
+// The two badge states. A colour swap, never a re-layout (F-M11 structured the mic
+// badge so this is only a paint change).
+enum PlayedBadgeState { unplayed, played }
+
+// Which "played" fact the mic badge reflects, and the asymmetry that IS the feature:
+//   incoming note → playedByMe    ("I have listened to this")
+//   own note      → playedByOther ("they have listened to mine")
+// Crossing these would light your OWN badge when the other person listens, which
+// reads as a bug rather than a receipt — so the branch is on isMine, once, here.
+PlayedBadgeState resolvePlayedBadge(ChatMessage m) {
+  final played = m.isMine ? m.playedByOther : m.playedByMe;
+  return played ? PlayedBadgeState.played : PlayedBadgeState.unplayed;
+}
+
 // Parse a server waveform string back into 0–100 levels for rendering. Null/empty →
 // an empty list; the bubble draws a flat bar for that (never an error). Malformed
 // entries are skipped defensively rather than throwing on a bad payload.

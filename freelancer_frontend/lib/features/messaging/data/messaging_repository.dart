@@ -166,6 +166,17 @@ class MessagingRepository {
     await _dio.post('/api/conversations/$conversationId/read');
   }
 
+  // 8b. Voice note played receipt (F-M11 M7) — 204, idempotent. Sirf caller ke
+  //     INCOMING voice note pe call hoti hai (own/non-voice/tombstone server 400
+  //     deta — client pehle hi guard karta, dekho shouldMarkPlayed). Server sirf us
+  //     call pe MessagePlayed event fire karta jo record actually insert kare, is
+  //     liye repeat calls chup rehti hain.
+  Future<void> markPlayed(String conversationId, String messageId) async {
+    await _dio.post(
+      '/api/conversations/$conversationId/messages/$messageId/played',
+    );
+  }
+
   // 9. Single conversation — cold deep-link / push-notification tap / 403 reconciliation.
   //    200 → participant; 403 → outsider (DioException.response.statusCode == 403);
   //    404 → unknown id. Callers check statusCode to distinguish from transport failures.

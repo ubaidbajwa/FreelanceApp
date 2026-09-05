@@ -76,6 +76,13 @@ class ChatMessage {
   // Null for non-media or once confirmed.
   final double? uploadProgress;
 
+  // F-M11 M7 — played receipts (voice notes). Caller-relative: playedByMe = I have
+  // listened to this INCOMING note; playedByOther = the other person listened to my
+  // OWN note. Both default false. The badge reads exactly one of them per direction
+  // (resolvePlayedBadge); crossing them is the bug the whole feature must avoid.
+  final bool playedByMe;
+  final bool playedByOther;
+
   const ChatMessage({
     required this.id,
     required this.senderId,
@@ -103,6 +110,8 @@ class ChatMessage {
     this.mediaWaveform,
     this.mediaLocalPath,
     this.uploadProgress,
+    this.playedByMe = false,
+    this.playedByOther = false,
   });
 
   ChatMessage copyWith({
@@ -116,6 +125,8 @@ class ChatMessage {
     String? myReactionEmoji,
     bool clearMyReaction = false,
     double? uploadProgress,
+    bool? playedByMe,
+    bool? playedByOther,
   }) => ChatMessage(
     id: id,
     senderId: senderId,
@@ -147,6 +158,8 @@ class ChatMessage {
     mediaWaveform: mediaWaveform,
     mediaLocalPath: mediaLocalPath,
     uploadProgress: uploadProgress ?? this.uploadProgress,
+    playedByMe: playedByMe ?? this.playedByMe,
+    playedByOther: playedByOther ?? this.playedByOther,
   );
 }
 
@@ -405,6 +418,12 @@ class ChatNotifier extends Notifier<ChatState> {
         .where((e) => e.name == 'ConversationRead')
         .listen(_onConversationRead);
 
+    // M7 played receipts: fires to the SENDER only, on the play that actually
+    // inserted the record → it always means "they played MINE". Set playedByOther.
+    final playedSub = client.events
+        .where((e) => e.name == 'MessagePlayed')
+        .listen(_onMessagePlayed);
+
     // Reconnect gap: if socket reconnects while chat is open, fetch missed messages.
     // Fan-out events are not replayed — without this, the chat and tile disagree.
     //
@@ -441,6 +460,7 @@ class ChatNotifier extends Notifier<ChatState> {
       editedSub.cancel();
       reactionSub.cancel();
       readSub.cancel();
+      playedSub.cancel();
       _markReadTimer?.cancel();
       _reconnectDebounce?.cancel();
     });
@@ -685,6 +705,9 @@ class ChatNotifier extends Notifier<ChatState> {
     mediaDurationMs: m.mediaDurationMs,
     mediaMimeType: m.mediaMimeType,
     mediaWaveform: m.mediaWaveform,
+    // F-M11 M7 — played receipts arrive on the server entry (caller-relative).
+    playedByMe: m.playedByMe,
+    playedByOther: m.playedByOther,
   );
 
   // The caller's own reaction emoji (at most one per user), or null. Used only when
@@ -1312,6 +1335,53 @@ class ChatNotifier extends Notifier<ChatState> {
       return;
     }
     state = state.copyWith(otherLastReadAt: merged);
+  }
+
+  // ── Played receipts (F-M11 M7) ────────────────────────────────────────────
+
+  // The caller started playing an INCOMING note. Optimistically flip the badge —
+  // the user pressed play, they know it played; don't wait for the round trip — then
+  // fire the receipt. shouldMarkPlayed gates own/non-voice/tombstone/already-played,
+  // so a call here is a genuine first play. Resume-after-pause never reaches this:
+  // the caller only invokes it on a fresh playback start.
+  //
+  // On failure: SILENT. A played receipt is invisible and not worth an interruption.
+  // Roll the badge back to unplayed so the NEXT play retries naturally, and log.
+  Future<void> markPlayed(String messageId) async {
+    final msg = _findById(messageId);
+    if (msg == null || !shouldMarkPlayed(msg)) return;
+    _setPlayedByMe(messageId, true); // optimistic
+    try {
+      await _repo.markPlayed(_conversationId, messageId);
+    } catch (e) {
+      _setPlayedByMe(messageId, false); // roll back; next play retries
+      debugPrint('markPlayed failed (non-critical): $e');
+    }
+  }
+
+  void _setPlayedByMe(String id, bool value) {
+    state = state.copyWith(
+      messages: state.messages
+          .map((m) => m.id == id ? m.copyWith(playedByMe: value) : m)
+          .toList(),
+    );
+  }
+
+  // MessagePlayed reaches the SENDER only, so it always means "they played MINE" —
+  // set playedByOther, NEVER playedByMe (crossing them would light my own badge when
+  // the other person listens, reading as a bug). An event for a message not in local
+  // state is ignored. The server fires it only on the insert, so repeats push nothing.
+  void _onMessagePlayed(RealtimeEvent e) {
+    final convId = e.payload['conversationId'] as String?;
+    if (convId == null || convId != _conversationId) return;
+    final id = e.payload['messageId'] as String?;
+    if (id == null) return;
+    if (!state.messages.any((m) => m.id == id)) return; // not loaded → ignore
+    state = state.copyWith(
+      messages: state.messages
+          .map((m) => m.id == id ? m.copyWith(playedByOther: true) : m)
+          .toList(),
+    );
   }
 
   // Returns the newer of the two watermarks (UTC), never moving backwards. A null

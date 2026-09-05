@@ -57,6 +57,8 @@ class _FakeRepo implements MessagingRepository {
   @override
   Future<void> markRead(String c) async {}
   @override
+  Future<void> markPlayed(String c, String m) async {}
+  @override
   Future<void> deleteMessage(String c, String m, {required String scope}) async {}
   @override
   Future<void> pinMessage(String c, String m,

@@ -245,6 +245,14 @@ class Message {
   // null = koi samples nahi → bubble flat bar dikhata hai. Voice pe hi set hota.
   final String? mediaWaveform;
 
+  // ===== F-M11 M7 played receipts (additive, voice only) =====
+  // Dono caller-relative booleans, default false → parsing additive rehti hai
+  // (purana payload bina in fields ke bhi parse hota). playedByMe = caller ne yeh
+  // INCOMING note sun liya; playedByOther = doosre ne caller ki APNI note suni.
+  // Asymmetry hi feature hai — dekho resolvePlayedBadge (message_actions.dart).
+  final bool playedByMe;
+  final bool playedByOther;
+
   const Message({
     required this.id,
     required this.conversationId,
@@ -269,6 +277,8 @@ class Message {
     this.mediaDurationMs,
     this.mediaMimeType,
     this.mediaWaveform,
+    this.playedByMe = false,
+    this.playedByOther = false,
   });
 
   factory Message.fromJson(Map<String, dynamic> json) => Message(
@@ -305,6 +315,8 @@ class Message {
         mediaDurationMs: json['mediaDurationMs'] as int?,
         mediaMimeType: json['mediaMimeType'] as String?,
         mediaWaveform: json['mediaWaveform'] as String?,
+        playedByMe: json['playedByMe'] as bool? ?? false,
+        playedByOther: json['playedByOther'] as bool? ?? false,
       );
 }
 

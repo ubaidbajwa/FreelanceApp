@@ -87,6 +87,9 @@ class _FakeRepo implements MessagingRepository {
   @override
   Future<void> markRead(String conversationId) async {}
 
+  @override
+  Future<void> markPlayed(String conversationId, String messageId) async {}
+
   // ---- unused in these tests ----
   @override
   Future<List<Message>> getPinnedMessages(String conversationId) async => [];

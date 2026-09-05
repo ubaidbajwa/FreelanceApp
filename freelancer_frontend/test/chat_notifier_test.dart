@@ -75,6 +75,9 @@ class _FakeRepo implements MessagingRepository {
   Future<void> markRead(String conversationId) async {}
 
   @override
+  Future<void> markPlayed(String conversationId, String messageId) async {}
+
+  @override
   Future<PagedResult<ConversationSummary>> getConversations(
           {int page = 1, int pageSize = 20}) async =>
       const PagedResult(

@@ -135,6 +135,9 @@ class SignalRRealtimeClient implements RealtimeClient {
       'ReactionChanged',
       // M4 — read receipts: fires to the OTHER participant with the new watermark.
       'ConversationRead',
+      // M7 — played receipts: fires to the SENDER when the other side plays their
+      // voice note. Payload {conversationId, messageId} → default Map extraction.
+      'MessagePlayed',
     ]) {
       hub.on(event, _makeInvocationFunc(event));
     }

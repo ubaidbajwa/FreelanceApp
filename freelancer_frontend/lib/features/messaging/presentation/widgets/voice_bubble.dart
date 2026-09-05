@@ -70,19 +70,21 @@ class VoiceBubble extends ConsumerWidget {
     // Bind to a promoted non-null local — no `!` on the server-supplied nullable.
     final playUrl = message.mediaUrl;
     final onToggle = (canPlay && playUrl != null)
-        ? () => ref
-              .read(voicePlaybackProvider.notifier)
-              .toggle(message.id, playUrl)
+        ? () => _startOrToggle(ref, playUrl)
         : null;
 
-    // Mic badge icon: muted (unplayed) state only.
-    // TODO(played-receipts): swap badge colour to gold once backend ships a
-    // MessagePlay table (same shape as MessageDeletion / MessageReaction).
-    // Do NOT use LastReadAt as a "played" proxy — it tracks text reads, not audio
-    // plays, and diverges whenever a message is read on another device.
-    final micBadgeIconColor = mine
+    // Mic badge (F-M11 M7): a COLOUR SWAP, never a re-layout. Incoming note reflects
+    // playedByMe ("I have listened"); own note reflects playedByOther ("they have
+    // listened to mine") — the asymmetry lives in resolvePlayedBadge. Unplayed → the
+    // muted treatment; played → gold. Never blue: gold is the app accent (CLAUDE.md),
+    // already used for read ticks and the waveform playhead.
+    final unplayedBadgeColor = mine
         ? Colors.white.withValues(alpha: 0.50)
         : _navy.withValues(alpha: 0.40);
+    final micBadgeIconColor =
+        resolvePlayedBadge(message) == PlayedBadgeState.played
+        ? _gold
+        : unplayedBadgeColor;
 
     return Column(
       mainAxisSize: MainAxisSize.min,
@@ -189,7 +191,17 @@ class VoiceBubble extends ConsumerWidget {
                 ),
               ),
               child: Center(
-                child: Icon(Icons.mic, size: 9, color: micBadgeIconColor),
+                // Animate the colour so a played event doesn't pop harshly. begin
+                // is null → no motion on first paint (the resolved colour shows
+                // immediately); it lerps only when micBadgeIconColor CHANGES, i.e.
+                // when MessagePlayed flips the badge to gold mid-screen.
+                child: TweenAnimationBuilder<Color?>(
+                  duration: const Duration(milliseconds: 250),
+                  curve: Curves.easeOut,
+                  tween: ColorTween(end: micBadgeIconColor),
+                  builder: (context, color, _) =>
+                      Icon(Icons.mic, size: 9, color: color ?? micBadgeIconColor),
+                ),
               ),
             ),
           ),
@@ -296,6 +308,17 @@ class VoiceBubble extends ConsumerWidget {
     );
   }
 
+  // Toggle playback, and on a genuine START (not resume-after-pause) fire the played
+  // receipt. "Fresh start" = this note is not the one currently loaded in the shared
+  // player; a paused note is still active, so resuming it must NOT re-mark. The
+  // notifier applies shouldMarkPlayed (own/non-voice/tombstone/already-played skip),
+  // so calling it unconditionally on a fresh start is safe.
+  void _startOrToggle(WidgetRef ref, String url) {
+    final freshStart = !ref.read(voicePlaybackProvider).isActive(message.id);
+    ref.read(voicePlaybackProvider.notifier).toggle(message.id, url);
+    if (freshStart) ref.read(chatProvider.notifier).markPlayed(message.id);
+  }
+
   // Tap-to-seek: fraction maps dx → 0..1. Starts playback if note isn't loaded yet.
   void _onWaveformTap(WidgetRef ref, double dx, double width) {
     if (width <= 0) return;
@@ -307,7 +330,9 @@ class VoiceBubble extends ConsumerWidget {
     if (playback.isActive(message.id)) {
       notifier.seekFraction(message.id, fraction);
     } else {
+      // Fresh start from a waveform tap → also fire the played receipt.
       notifier.toggle(message.id, tapUrl);
+      ref.read(chatProvider.notifier).markPlayed(message.id);
     }
   }
 }
