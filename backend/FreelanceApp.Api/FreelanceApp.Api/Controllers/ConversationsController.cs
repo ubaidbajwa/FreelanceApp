@@ -215,4 +215,13 @@ public class ConversationsController(IChatService chatService) : ControllerBase
         var created = await chatService.ForwardAsync(id, dto, ct);
         return Ok(created);
     }
+
+    // Mark a voice note as played by the caller. Idempotent — a second call is a no-op. 204 on success;
+    // 403 outsider · 404 unknown message · 400 non-voice / own note / tombstoned.
+    [HttpPost("{id:guid}/messages/{messageId:guid}/played")]
+    public async Task<IActionResult> MarkPlayed(Guid id, Guid messageId, CancellationToken ct)
+    {
+        await chatService.MarkPlayedAsync(id, messageId, ct);
+        return NoContent();
+    }
 }

@@ -63,4 +63,8 @@ public class SignalRChatNotifier(IHubContext<ChatHub> hub) : IChatNotifier
     public Task ConversationReadAsync(Guid userId, Guid conversationId, DateTime lastReadAt, CancellationToken ct = default)
         => hub.Clients.User(userId.ToString()).SendAsync("ConversationRead",
             new { conversationId, lastReadAt }, ct);
+
+    public Task MessagePlayedAsync(Guid userId, Guid conversationId, Guid messageId, CancellationToken ct = default)
+        => hub.Clients.User(userId.ToString()).SendAsync("MessagePlayed",
+            new { conversationId, messageId }, ct);
 }
