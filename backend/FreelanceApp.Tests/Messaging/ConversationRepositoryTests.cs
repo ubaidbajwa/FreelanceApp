@@ -46,6 +46,129 @@ public class ConversationRepositoryTests
         });
     }
 
+    private static Message AddImageMessage(AppDbContext db, Guid convId, Guid sender, DateTime at, bool deleted = false)
+    {
+        var m = new Message
+        {
+            Id = Guid.NewGuid(), ConversationId = convId, SenderId = sender,
+            Body = "cap", Type = MessageType.Image, CreatedAt = at,
+            DeletedAt = deleted ? at.AddSeconds(1) : null,
+            MediaUrl = "https://res.cloudinary.com/x/image/upload/v1/skillora/chat/img.jpg",
+            MediaThumbnailUrl = "https://res.cloudinary.com/x/image/upload/c_fill,w_400,q_auto/v1/skillora/chat/img.jpg",
+            MediaWidth = 800, MediaHeight = 600, MediaMimeType = "image/jpeg",
+            MediaSizeBytes = 1234, MediaPublicId = "skillora/chat/img"
+        };
+        db.Messages.Add(m);
+        return m;
+    }
+
+    // ===== MEDIA PROJECTION (M-M4) =====
+
+    // Guards that MediaThumbnailUrl is projected as its OWN column (its own CASE), not folded into
+    // MediaUrl's — a live media message must carry a non-null thumbnail through ProjectMessage.
+    [Fact]
+    public async Task GetMessages_LiveImage_ProjectsThumbnailUrl_NonNull()
+    {
+        using var db = NewContext();
+        var me = AddUser(db, "Me");
+        var alice = AddUser(db, "Alice");
+        var t0 = DateTime.UtcNow.AddMinutes(-5);
+        var conv = AddConversation(db, me.Id, alice.Id, ConversationStatus.Accepted, t0);
+        AddImageMessage(db, conv.Id, alice.Id, t0.AddMinutes(1));
+        await db.SaveChangesAsync();
+
+        var repo = new ConversationRepository(db);
+        var page = await repo.GetMessagesAsync(conv.Id, me.Id, before: null, limit: 30);
+
+        var dto = Assert.Single(page);
+        Assert.Equal(MessageType.Image, dto.Type);
+        Assert.False(dto.IsDeleted);
+        Assert.NotNull(dto.MediaUrl);
+        Assert.NotNull(dto.MediaThumbnailUrl);                       // the SECOND CASE column projected, not collapsed
+        Assert.Contains("c_fill,w_400,q_auto", dto.MediaThumbnailUrl!);
+        Assert.Equal(800, dto.MediaWidth);
+        Assert.Equal(600, dto.MediaHeight);
+    }
+
+    // Companion: a tombstoned media message blanks BOTH URL columns (privacy) but keeps dimensions.
+    [Fact]
+    public async Task GetMessages_DeletedImage_BlanksUrlAndThumbnail()
+    {
+        using var db = NewContext();
+        var me = AddUser(db, "Me");
+        var alice = AddUser(db, "Alice");
+        var t0 = DateTime.UtcNow.AddMinutes(-5);
+        var conv = AddConversation(db, me.Id, alice.Id, ConversationStatus.Accepted, t0);
+        AddImageMessage(db, conv.Id, alice.Id, t0.AddMinutes(1), deleted: true);
+        await db.SaveChangesAsync();
+
+        var repo = new ConversationRepository(db);
+        var page = await repo.GetMessagesAsync(conv.Id, me.Id, before: null, limit: 30);
+
+        var dto = Assert.Single(page);
+        Assert.True(dto.IsDeleted);
+        Assert.Null(dto.MediaUrl);
+        Assert.Null(dto.MediaThumbnailUrl);
+        Assert.Equal(800, dto.MediaWidth);   // dimensions are harmless metadata, kept
+    }
+
+    private static Message AddVoiceMessage(AppDbContext db, Guid convId, Guid sender, DateTime at, bool deleted = false)
+    {
+        var m = new Message
+        {
+            Id = Guid.NewGuid(), ConversationId = convId, SenderId = sender,
+            Body = string.Empty, Type = MessageType.Voice, CreatedAt = at,
+            DeletedAt = deleted ? at.AddSeconds(1) : null,
+            MediaUrl = "https://res.cloudinary.com/x/video/upload/v1/skillora/chat/voice.m4a",
+            MediaMimeType = "audio/mp4", MediaDurationMs = 8000, MediaSizeBytes = 34567,
+            MediaPublicId = "skillora/chat/voice", MediaWaveform = "10,20,30,40"
+        };
+        db.Messages.Add(m);
+        return m;
+    }
+
+    // Voice (M-M6): a live voice note projects its waveform (its OWN CASE column); no thumbnail/dimensions.
+    [Fact]
+    public async Task GetMessages_LiveVoice_ProjectsWaveform_NoThumbnail()
+    {
+        using var db = NewContext();
+        var me = AddUser(db, "Me");
+        var alice = AddUser(db, "Alice");
+        var t0 = DateTime.UtcNow.AddMinutes(-5);
+        var conv = AddConversation(db, me.Id, alice.Id, ConversationStatus.Accepted, t0);
+        AddVoiceMessage(db, conv.Id, alice.Id, t0.AddMinutes(1));
+        await db.SaveChangesAsync();
+
+        var repo = new ConversationRepository(db);
+        var dto = Assert.Single(await repo.GetMessagesAsync(conv.Id, me.Id, before: null, limit: 30));
+
+        Assert.Equal(MessageType.Voice, dto.Type);
+        Assert.Equal("10,20,30,40", dto.MediaWaveform);
+        Assert.NotNull(dto.MediaUrl);
+        Assert.Null(dto.MediaThumbnailUrl);   // no poster for a voice note
+        Assert.Equal(8000, dto.MediaDurationMs);
+    }
+
+    // Companion: a tombstoned voice note blanks BOTH the URL and the waveform.
+    [Fact]
+    public async Task GetMessages_DeletedVoice_BlanksUrlAndWaveform()
+    {
+        using var db = NewContext();
+        var me = AddUser(db, "Me");
+        var alice = AddUser(db, "Alice");
+        var t0 = DateTime.UtcNow.AddMinutes(-5);
+        var conv = AddConversation(db, me.Id, alice.Id, ConversationStatus.Accepted, t0);
+        AddVoiceMessage(db, conv.Id, alice.Id, t0.AddMinutes(1), deleted: true);
+        await db.SaveChangesAsync();
+
+        var repo = new ConversationRepository(db);
+        var dto = Assert.Single(await repo.GetMessagesAsync(conv.Id, me.Id, before: null, limit: 30));
+
+        Assert.True(dto.IsDeleted);
+        Assert.Null(dto.MediaUrl);
+        Assert.Null(dto.MediaWaveform);   // a waveform left on a deleted voice note would be a small leak
+    }
+
     // ===== ACCEPTED LIST PROJECTION =====
 
     [Fact]
@@ -161,6 +284,61 @@ public class ConversationRepositoryTests
 
         Assert.Empty(page.Items);
         Assert.Equal(0, page.TotalCount);
+    }
+
+    // ===== READ RECEIPT: otherLastReadAt watermark =====
+
+    [Fact]
+    public async Task GetAcceptedPage_OtherLastReadAt_IsCallerRelative()
+    {
+        using var db = NewContext();
+        var me = AddUser(db, "Me");
+        var alice = AddUser(db, "Alice");
+
+        var t0 = DateTime.UtcNow.AddMinutes(-10);
+        var conv = AddConversation(db, me.Id, alice.Id, ConversationStatus.Accepted, t0);
+        AddMessage(db, conv.Id, me.Id, "hi", t0.AddMinutes(1));
+        conv.LastMessageAt = t0.AddMinutes(1);
+        await db.SaveChangesAsync();
+
+        // Each participant has their OWN read watermark at a distinct time.
+        var aliceRead = t0.AddMinutes(3);
+        var myRead = t0.AddMinutes(5);
+        db.ConversationParticipants.Single(p => p.ConversationId == conv.Id && p.UserId == alice.Id).LastReadAt = aliceRead;
+        db.ConversationParticipants.Single(p => p.ConversationId == conv.Id && p.UserId == me.Id).LastReadAt = myRead;
+        await db.SaveChangesAsync();
+
+        var repo = new ConversationRepository(db);
+
+        // From MY perspective, otherLastReadAt is ALICE's watermark — not my own.
+        var mine = Assert.Single((await repo.GetAcceptedPageAsync(me.Id, 1, 20)).Items);
+        Assert.Equal(aliceRead, mine.OtherLastReadAt);
+
+        // From ALICE's perspective, it flips to MY watermark.
+        var hers = Assert.Single((await repo.GetAcceptedPageAsync(alice.Id, 1, 20)).Items);
+        Assert.Equal(myRead, hers.OtherLastReadAt);
+    }
+
+    [Fact]
+    public async Task GetAcceptedPage_OtherLastReadAt_NullWhenOtherNeverRead()
+    {
+        using var db = NewContext();
+        var me = AddUser(db, "Me");
+        var alice = AddUser(db, "Alice");
+
+        var t0 = DateTime.UtcNow.AddMinutes(-10);
+        var conv = AddConversation(db, me.Id, alice.Id, ConversationStatus.Accepted, t0);
+        AddMessage(db, conv.Id, me.Id, "hi", t0.AddMinutes(1));
+        conv.LastMessageAt = t0.AddMinutes(1);
+        await db.SaveChangesAsync();
+        // I have read; Alice never has.
+        db.ConversationParticipants.Single(p => p.ConversationId == conv.Id && p.UserId == me.Id).LastReadAt = t0.AddMinutes(2);
+        await db.SaveChangesAsync();
+
+        var repo = new ConversationRepository(db);
+
+        var mine = Assert.Single((await repo.GetAcceptedPageAsync(me.Id, 1, 20)).Items);
+        Assert.Null(mine.OtherLastReadAt);   // Alice has no watermark yet
     }
 
     // ===== OUTGOING PENDING (Fix 1): the sender's own request is their conversation =====

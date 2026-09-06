@@ -45,4 +45,19 @@ public interface IChatNotifier
     /// </summary>
     Task MessagePinChangedAsync(IEnumerable<Guid> userIds, Guid conversationId, Guid messageId,
         bool isPinned, DateTime? pinExpiresAt, CancellationToken ct = default);
+
+    /// <summary>
+    /// A participant read the conversation up to <paramref name="lastReadAt"/>. Sent to the OTHER
+    /// participant only so their sent messages can flip to the read tick — the reader is not told
+    /// they read something. One watermark per conversation updates every bubble at once.
+    /// </summary>
+    Task ConversationReadAsync(Guid userId, Guid conversationId, DateTime lastReadAt, CancellationToken ct = default);
+
+    /// <summary>
+    /// A voice note the recipient just played (M-M7). Sent to the SENDER only — they are the one
+    /// whose bubble changes (the mic badge turns accent-coloured); the player already knows they
+    /// pressed play. Fired only when a NEW play record was inserted — a repeat call is a no-op and
+    /// pushes nothing.
+    /// </summary>
+    Task MessagePlayedAsync(Guid userId, Guid conversationId, Guid messageId, CancellationToken ct = default);
 }

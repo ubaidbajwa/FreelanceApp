@@ -1,5 +1,6 @@
 using FreelanceApp.Application.Common.Models;
 using FreelanceApp.Application.Features.Messaging.DTOs;
+using FreelanceApp.Application.Interfaces.Services;
 
 namespace FreelanceApp.Application.Features.Messaging.Services;
 
@@ -18,6 +19,16 @@ public interface IChatService
 
     /// <summary>Send a message (enforces the pending-request 1-message rule and implicit accept-on-reply).</summary>
     Task<MessageDto> SendMessageAsync(Guid conversationId, SendMessageRequestDto dto, CancellationToken ct = default);
+
+    /// <summary>
+    /// Send an image/video in ONE request: validate the file (type/size/magic bytes; video duration
+    /// after upload), upload to Cloudinary, then create the message through the SAME SendCore path as
+    /// text — so it inherits the participant gate, the declined check, and the pending 1-message rule.
+    /// The upload happens only AFTER those gates pass, so a rejected send never orphans a Cloudinary
+    /// file. Caption (optional) is stored as the body. Throws 400 naming the specific limit on a bad file.
+    /// </summary>
+    Task<MessageDto> SendMediaMessageAsync(
+        Guid conversationId, SendMediaMessageRequestDto request, MediaUploadInput file, CancellationToken ct = default);
 
     Task AcceptAsync(Guid conversationId, CancellationToken ct = default);
     Task DeclineAsync(Guid conversationId, CancellationToken ct = default);
@@ -61,4 +72,11 @@ public interface IChatService
 
     /// <summary>Forward one or more source-conversation messages into a target conversation (reuses the send path).</summary>
     Task<IReadOnlyList<MessageDto>> ForwardAsync(Guid sourceConversationId, ForwardMessagesRequestDto dto, CancellationToken ct = default);
+
+    /// <summary>
+    /// Mark a voice note as played by the caller (M-M7). Participant only (else 403); unknown message
+    /// 404; non-Voice, own note, or tombstoned message 400. Idempotent — a second call is a no-op that
+    /// fires no event. On the FIRST play it notifies the sender only.
+    /// </summary>
+    Task MarkPlayedAsync(Guid conversationId, Guid messageId, CancellationToken ct = default);
 }

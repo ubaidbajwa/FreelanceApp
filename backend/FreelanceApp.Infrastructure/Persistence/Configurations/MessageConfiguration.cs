@@ -54,6 +54,20 @@ public class MessageConfiguration : IEntityTypeConfiguration<Message>
         builder.Property(m => m.SystemEventType)
             .HasColumnType("integer");
 
+        // ===== Media columns (M-M4, additive, all nullable) =====
+        // Body keeps IsRequired() above — for media it holds the caption, and an empty string still
+        // satisfies NOT NULL, so no existing read path changes and the column need not become nullable.
+        builder.Property(m => m.MediaUrl).HasMaxLength(500);
+        builder.Property(m => m.MediaThumbnailUrl).HasMaxLength(500);
+        builder.Property(m => m.MediaMimeType).HasMaxLength(100);
+        builder.Property(m => m.MediaPublicId).HasMaxLength(255);
+        // Document original filename (M-M8): sanitised before storage; 255 is the conventional filename cap.
+        builder.Property(m => m.MediaFileName).HasMaxLength(255);
+        // Voice waveform (M-M6): comma-separated amplitude samples. 512 bounds it (64×3 + 63 ≤ 255).
+        builder.Property(m => m.MediaWaveform).HasMaxLength(512);
+        // MediaWidth / MediaHeight / MediaDurationMs (int?) and MediaSizeBytes (long?) map to
+        // nullable integer / bigint by convention — no explicit configuration needed.
+
         // Cursor pagination isi composite index se chalti hai (thread ke messages, time order)
         builder.HasIndex(m => new { m.ConversationId, m.CreatedAt })
             .HasDatabaseName("IX_Messages_ConversationId_CreatedAt");

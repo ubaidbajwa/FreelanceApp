@@ -49,6 +49,35 @@ public class Message
     public SystemEventType? SystemEventType { get; set; }
     public Guid? SystemTargetMessageId { get; set; }
 
+    // ===== Media fields (M-M4, additive, ALL nullable) — populated only for Type Image/Video =====
+    // Body doubles as the caption for media (required only for Text; empty string is valid for media).
+
+    public string? MediaUrl { get; set; }            // Cloudinary secure URL of the full asset (max 500)
+    public string? MediaThumbnailUrl { get; set; }   // Poster: image = resized variant, video = so_0 poster (max 500)
+    public int? MediaWidth { get; set; }             // Intrinsic width  — client reserves layout space before load
+    public int? MediaHeight { get; set; }            // Intrinsic height — without both, every incoming photo jumps the list
+    public int? MediaDurationMs { get; set; }        // Video only (from Cloudinary's upload result)
+    public long? MediaSizeBytes { get; set; }        // Asset size in bytes
+    public string? MediaMimeType { get; set; }       // Validated declared content type (max 100)
+
+    // Voice waveform (M-M6) — comma-separated amplitude samples (each 0–100, at most 64), computed by
+    // the CLIENT while recording (no server-side audio decoding / ffmpeg). Null for image/video and for
+    // a voice note whose client sent none — the client then falls back to a flat bar. Blanked in the
+    // projection for a tombstone, exactly like the media URLs. Max 512 (64×3 digits + 63 commas ≤ 255).
+    public string? MediaWaveform { get; set; }
+
+    // Document original filename (M-M8) — max 255. Unlike a photo, a document's name IS content to the
+    // user (contract_final_v3.pdf). SANITISED before it is stored (path components, null/control chars
+    // and bidirectional-override characters stripped; extension forced to the validated type). Null for
+    // non-document messages. Blanked in the projection for a tombstone, like the media URLs — a filename
+    // (salary_negotiation_final.pdf) leaks meaning even when the file is gone.
+    public string? MediaFileName { get; set; }       // max 255
+
+    // Cloudinary public id — needed for later deletion. SERVER-ONLY: deliberately never on the wire
+    // (not in MessageDto). A forward reuses this same id (a reference, not a copy), which is why
+    // delete-for-everyone must NOT delete the Cloudinary asset — see docs/TODO.md.
+    public string? MediaPublicId { get; set; }       // max 255
+
     // ===== Navigation Properties =====
     public Conversation? Conversation { get; set; }
     public User? Sender { get; set; }
@@ -58,4 +87,7 @@ public class Message
 
     public ICollection<MessageReaction> Reactions { get; set; } = new List<MessageReaction>();
     public ICollection<MessageDeletion> Deletions { get; set; } = new List<MessageDeletion>();
+
+    // Per-user "played" records for a voice note (M-M7). Existence of a row = that user played it.
+    public ICollection<MessagePlay> Plays { get; set; } = new List<MessagePlay>();
 }

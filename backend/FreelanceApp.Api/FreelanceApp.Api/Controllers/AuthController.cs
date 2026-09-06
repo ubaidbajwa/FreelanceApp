@@ -9,10 +9,12 @@ namespace FreelanceApp.Api.Controllers;
 
 [ApiController]
 [Route("api/auth")]
-[EnableRateLimiting("auth")]
+// No class-level policy — each action opts into the policy that fits its abuse surface. Endpoints
+// without an explicit policy still fall under the global per-IP / per-user ceiling (see Program.cs).
 public class AuthController(IAuthService authService) : ControllerBase
 {
     [HttpPost("register")]
+    [EnableRateLimiting("register")]   // 3 per hour per IP — account creation
     public async Task<IActionResult> Register([FromBody] RegisterRequestDto dto)
     {
         // Email pehle se ho to service 409 Conflict throw karti hai —
@@ -30,6 +32,7 @@ public class AuthController(IAuthService authService) : ControllerBase
     }
 
     [HttpPost("login")]
+    [EnableRateLimiting("login")]   // 5 per 15 min per IP — brute force / credential stuffing
     public async Task<IActionResult> Login([FromBody] LoginRequestDto dto)
     {
         var result = await authService.LoginAsync(dto);
@@ -61,6 +64,7 @@ public class AuthController(IAuthService authService) : ControllerBase
     }
 
     [HttpPost("verify-email")]
+    [EnableRateLimiting("otp")]   // 5 per 15 min per IP — OTP guessing surface
     public async Task<IActionResult> VerifyEmail([FromBody] VerifyEmailRequestDto dto)
     {
         await authService.VerifyEmailAsync(dto);
@@ -76,7 +80,7 @@ public class AuthController(IAuthService authService) : ControllerBase
     }
 
     [HttpPost("forgot-password")]
-    [EnableRateLimiting("otp")]   // stricter: 3 per 5 min — email bhejta hai
+    [EnableRateLimiting("forgot-password")]   // 3 per hour per IP — sends an email
     public async Task<IActionResult> ForgotPassword([FromBody] ForgotPasswordRequestDto dto)
     {
         await authService.ForgotPasswordAsync(dto);
@@ -84,6 +88,7 @@ public class AuthController(IAuthService authService) : ControllerBase
     }
 
     [HttpPost("reset-password")]
+    [EnableRateLimiting("otp")]   // 5 per 15 min per IP — OTP guessing surface
     public async Task<IActionResult> ResetPassword([FromBody] ResetPasswordRequestDto dto)
     {
         await authService.ResetPasswordAsync(dto);

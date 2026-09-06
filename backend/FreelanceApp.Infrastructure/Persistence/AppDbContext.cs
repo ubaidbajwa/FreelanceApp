@@ -23,6 +23,7 @@ public class AppDbContext : DbContext
     public DbSet<Message> Messages { get; set; } = null!;
     public DbSet<MessageReaction> MessageReactions { get; set; } = null!;
     public DbSet<MessageDeletion> MessageDeletions { get; set; } = null!;
+    public DbSet<MessagePlay> MessagePlays { get; set; } = null!;
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -41,5 +42,7 @@ public class AppDbContext : DbContext
         modelBuilder.ApplyConfiguration(new MessageConfiguration());
         modelBuilder.ApplyConfiguration(new MessageReactionConfiguration());
         modelBuilder.ApplyConfiguration(new MessageDeletionConfiguration());
+        modelBuilder.ApplyConfiguration(new MessagePlayConfiguration());
+        modelBuilder.ApplyConfiguration(new MessagePlayConfiguration());
     }
 }

@@ -42,6 +42,28 @@ public class MessageQueryShapeTests
         // (a per-row collection here would Cartesian-explode the page).
         Assert.DoesNotContain("MessageReactions", sql);
 
+        // Voice "played" receipts (M-M7): playedByMe / playedByOther are two correlated EXISTS
+        // subqueries INSIDE this single SELECT — index seeks, not a projected collection. They must
+        // reference MessagePlays only through EXISTS, never as a JOIN (a per-row MessagePlays collection
+        // would Cartesian-explode the page and push the read past one statement).
+        Assert.Contains("MessagePlays", sql);
+        Assert.Contains("EXISTS", sql, StringComparison.OrdinalIgnoreCase);
+        // Both flags → exactly two correlated subqueries over MessagePlays.
+        Assert.Equal(2, Regex.Matches(sql, "FROM \"MessagePlays\"").Count);
+        // No collection join of MessagePlays into the page (guards the Cartesian-explosion regression).
+        Assert.DoesNotMatch(new Regex("JOIN\\s+\"MessagePlays\"", RegexOptions.IgnoreCase), sql);
+
+        // Media tombstone-blanking: MediaUrl and MediaThumbnailUrl must each be their OWN output column
+        // (each its own CASE), never two WHENs folded into one CASE (which would emit a single column and
+        // silently drop the thumbnail). Both blanking THENs must therefore appear as separate projections.
+        Assert.Contains("THEN t.\"MediaUrl\"", sql);
+        Assert.Contains("THEN t.\"MediaThumbnailUrl\"", sql);
+        // Voice waveform (M-M6) is blanked for a tombstone in its OWN CASE column too — same invariant.
+        Assert.Contains("THEN t.\"MediaWaveform\"", sql);
+        // Document filename (M-M8) is blanked for a tombstone in its OWN CASE column too — a filename
+        // leaks meaning even when the file is gone. Its own projection keeps the page a single SELECT.
+        Assert.Contains("THEN t.\"MediaFileName\"", sql);
+
         // ── Full-table-scan guard ──────────────────────────────────────────────
         // The replyTo resolution must NOT be a windowed subquery. A FirstOrDefault()/Take(1) over a
         // correlated Where makes EF emit `ROW_NUMBER() OVER(...)` inside a subquery that reads every

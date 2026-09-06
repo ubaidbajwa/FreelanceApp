@@ -7,7 +7,9 @@ using Microsoft.Extensions.Options;
 
 namespace FreelanceApp.Infrastructure.Services;
 
-public class CloudinaryImageService : IImageStorageService
+// Implements BOTH the simple image-URL seam (KYC / profile photos) and the richer media seam (chat
+// image/video with full metadata) — one Cloudinary integration, not two upload paths.
+public class CloudinaryImageService : IImageStorageService, IMediaStorageService
 {
     private readonly Cloudinary _cloudinary;
     private readonly ILogger<CloudinaryImageService> _logger;
@@ -74,6 +76,185 @@ public class CloudinaryImageService : IImageStorageService
         {
             _logger.LogWarning(ex, "Cloudinary delete threw for {PublicId}", publicId);
         }
+    }
+
+    // ===== IMediaStorageService (chat media, M-M4) =====
+
+    public async Task<MediaUploadResult> UploadImageAsync(
+        Stream content, string fileName, string folder, CancellationToken ct = default)
+    {
+        var uploadParams = new ImageUploadParams
+        {
+            File = new FileDescription(fileName, content),
+            Folder = folder,
+            UseFilename = false,
+            UniqueFilename = true,
+            Overwrite = false
+        };
+
+        var result = await _cloudinary.UploadAsync(uploadParams, ct);
+        if (result.Error != null)
+        {
+            _logger.LogError("Cloudinary image upload failed: {Error}", result.Error.Message);
+            throw new Exception($"Image upload failed: {result.Error.Message}");
+        }
+
+        return new MediaUploadResult
+        {
+            SecureUrl = result.SecureUrl.ToString(),
+            // Thumbnail = a resized, quality-reduced variant of the SAME asset (Cloudinary URL
+            // transformation) so a chat with thirty photos pulls thirty small thumbnails, not full files.
+            // Transformation string: "c_fill,w_400,q_auto".
+            ThumbnailUrl = BuildImageThumbnailUrl(result.SecureUrl.ToString()),
+            PublicId = result.PublicId,
+            Width = result.Width,
+            Height = result.Height,
+            DurationMs = null,
+            Bytes = result.Bytes
+        };
+    }
+
+    public async Task<MediaUploadResult> UploadVideoAsync(
+        Stream content, string fileName, string folder, CancellationToken ct = default)
+    {
+        var uploadParams = new VideoUploadParams
+        {
+            File = new FileDescription(fileName, content),
+            Folder = folder,
+            UseFilename = false,
+            UniqueFilename = true,
+            Overwrite = false
+        };
+
+        var result = await _cloudinary.UploadAsync(uploadParams, ct);
+        if (result.Error != null)
+        {
+            _logger.LogError("Cloudinary video upload failed: {Error}", result.Error.Message);
+            throw new Exception($"Video upload failed: {result.Error.Message}");
+        }
+
+        return new MediaUploadResult
+        {
+            SecureUrl = result.SecureUrl.ToString(),
+            // Video poster via URL transformation (NO ffmpeg / server-side processing).
+            // Transformation string: "so_0,w_400,c_fill" with a ".jpg" extension.
+            ThumbnailUrl = BuildVideoThumbnailUrl(result.SecureUrl.ToString()),
+            PublicId = result.PublicId,
+            Width = result.Width,
+            Height = result.Height,
+            DurationMs = double.IsNaN(result.Duration) ? null : (int)Math.Round(result.Duration * 1000),
+            Bytes = result.Bytes
+        };
+    }
+
+    public async Task<MediaUploadResult> UploadAudioAsync(
+        Stream content, string fileName, string folder, CancellationToken ct = default)
+    {
+        // Audio has no distinct Cloudinary resource type — it is uploaded as VIDEO. VideoUploadParams
+        // sets resource_type=video, which is exactly what Cloudinary expects for m4a/aac/ogg/webm audio.
+        // No thumbnail (no poster for audio) and no width/height — only URL, duration, size, public id.
+        var uploadParams = new VideoUploadParams
+        {
+            File = new FileDescription(fileName, content),
+            Folder = folder,
+            UseFilename = false,
+            UniqueFilename = true,
+            Overwrite = false
+        };
+
+        var result = await _cloudinary.UploadAsync(uploadParams, ct);
+        if (result.Error != null)
+        {
+            _logger.LogError("Cloudinary audio upload failed: {Error}", result.Error.Message);
+            throw new Exception($"Audio upload failed: {result.Error.Message}");
+        }
+
+        return new MediaUploadResult
+        {
+            SecureUrl = result.SecureUrl.ToString(),
+            ThumbnailUrl = string.Empty,   // no poster for a voice note — ChatService maps this to null
+            PublicId = result.PublicId,
+            Width = 0,
+            Height = 0,
+            DurationMs = double.IsNaN(result.Duration) ? null : (int)Math.Round(result.Duration * 1000),
+            Bytes = result.Bytes
+        };
+    }
+
+    public async Task<MediaUploadResult> UploadDocumentAsync(
+        Stream content, string fileName, string folder, CancellationToken ct = default)
+    {
+        // Documents upload as RAW (RawUploadParams sets resource_type=raw): Cloudinary stores the bytes
+        // verbatim, so no image/document transformation pipeline ever touches attacker-supplied files —
+        // the server only stores and serves them (see ADR 0004 §10). No thumbnail, no dimensions, no
+        // duration for a document — only URL, size and public id are meaningful.
+        var uploadParams = new RawUploadParams
+        {
+            File = new FileDescription(fileName, content),
+            Folder = folder,
+            UseFilename = false,
+            UniqueFilename = true,
+            Overwrite = false
+        };
+
+        // resource_type=raw: store the bytes verbatim, no transformation pipeline touches them.
+        var result = await _cloudinary.UploadAsync(uploadParams, "raw", ct);
+        if (result.Error != null)
+        {
+            _logger.LogError("Cloudinary document upload failed: {Error}", result.Error.Message);
+            throw new Exception($"Document upload failed: {result.Error.Message}");
+        }
+
+        return new MediaUploadResult
+        {
+            SecureUrl = result.SecureUrl.ToString(),
+            ThumbnailUrl = string.Empty,   // no poster for a document — ChatService maps this to null
+            PublicId = result.PublicId,
+            Width = 0,
+            Height = 0,
+            DurationMs = null,
+            Bytes = result.Bytes
+        };
+    }
+
+    public async Task DeleteAsync(string publicId, MediaKind kind, CancellationToken ct = default)
+    {
+        try
+        {
+            var result = await _cloudinary.DestroyAsync(new DeletionParams(publicId)
+            {
+                // Delete must pass the SAME resource type the asset was uploaded under, or Cloudinary
+                // silently no-ops and leaves an orphan. Audio is stored under Video; documents under Raw.
+                ResourceType = kind switch
+                {
+                    MediaKind.Video or MediaKind.Audio => ResourceType.Video,
+                    MediaKind.Document => ResourceType.Raw,
+                    _ => ResourceType.Image
+                }
+            });
+            if (result.Error != null || result.Result != "ok")
+                _logger.LogWarning("Cloudinary media delete failed for {PublicId}: {Error}",
+                    publicId, result.Error?.Message ?? result.Result);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Cloudinary media delete threw for {PublicId}", publicId);
+        }
+    }
+
+    // Inject the image thumbnail transformation immediately after "/image/upload/". A resized (w_400),
+    // filled (c_fill), auto-quality (q_auto) variant of the same asset.
+    private static string BuildImageThumbnailUrl(string secureUrl) =>
+        secureUrl.Replace("/image/upload/", "/image/upload/c_fill,w_400,q_auto/");
+
+    // Build a video POSTER: inject "so_0,w_400,c_fill" after "/video/upload/" (start-offset 0 frame,
+    // width 400, fill) and swap the extension to ".jpg" so Cloudinary renders a still image.
+    private static string BuildVideoThumbnailUrl(string secureUrl)
+    {
+        var withTransform = secureUrl.Replace("/video/upload/", "/video/upload/so_0,w_400,c_fill/");
+        var lastSlash = withTransform.LastIndexOf('/');
+        var lastDot = withTransform.LastIndexOf('.');
+        return lastDot > lastSlash ? withTransform[..lastDot] + ".jpg" : withTransform + ".jpg";
     }
 
     // URL format: https://res.cloudinary.com/<cloud>/image/upload/v123456/folder/name.jpg

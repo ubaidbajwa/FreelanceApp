@@ -131,7 +131,7 @@ public class ConversationRepository : IConversationRepository
         join ou in _context.Users on other.UserId equals ou.Id
         join p in _context.Profiles on ou.Id equals p.UserId into pg
         from p in pg.DefaultIfEmpty()
-        select new ConversationRow { Conversation = c, MyParticipant = cp, OtherUser = ou, OtherProfile = p };
+        select new ConversationRow { Conversation = c, MyParticipant = cp, OtherParticipant = other, OtherUser = ou, OtherProfile = p };
 
     // Single projection reused by both pages. Correlated subqueries resolve the last-message
     // preview and unread count in the SAME statement — query count is constant, independent
@@ -161,6 +161,16 @@ public class ConversationRepository : IConversationRepository
                 .OrderByDescending(m => m.CreatedAt).ThenByDescending(m => m.Id)
                 .Select(m => m.Body.Length > 120 ? m.Body.Substring(0, 120) : m.Body)
                 .FirstOrDefault(),
+            // Type of that SAME last content message (identical filter + order), so an uncaptioned photo
+            // whose preview is empty still renders a localised "Photo"/"Video" label on the client. This
+            // is one more correlated subquery inside the SAME list SELECT — NOT an extra statement, same
+            // as LastMessagePreview and UnreadCount already are.
+            LastMessageType = _context.Messages
+                .Where(m => m.ConversationId == x.Conversation.Id && m.DeletedAt == null
+                            && m.Type != MessageType.System)
+                .OrderByDescending(m => m.CreatedAt).ThenByDescending(m => m.Id)
+                .Select(m => (MessageType?)m.Type)
+                .FirstOrDefault(),
             // Unread = messages from the OTHER side newer than my read watermark.
             // System messages are excluded — an activity marker (pin/unpin) should not bump the
             // unread badge; it is noise, not content the recipient needs to respond to.
@@ -169,7 +179,10 @@ public class ConversationRepository : IConversationRepository
                 m.SenderId != userId &&
                 m.DeletedAt == null &&
                 m.Type != MessageType.System &&
-                (x.MyParticipant.LastReadAt == null || m.CreatedAt > x.MyParticipant.LastReadAt))
+                (x.MyParticipant.LastReadAt == null || m.CreatedAt > x.MyParticipant.LastReadAt)),
+            // The OTHER participant's read watermark (caller-relative). `other` is the lateral-join
+            // row already in the FROM/JOIN, so this is one more selected column — NOT a new statement.
+            OtherLastReadAt = x.OtherParticipant.LastReadAt
         };
 
     public async Task<IReadOnlyList<MessageDto>> GetMessagesAsync(
@@ -238,6 +251,31 @@ public class ConversationRepository : IConversationRepository
             IsForwarded = m.ForwardedFromMessageId != null,
             SystemEventType = m.SystemEventType,
             SystemTargetMessageId = m.SystemTargetMessageId,
+            // Media: blank the URLs IN SQL for a "delete for everyone" tombstone — a Cloudinary URL is
+            // publicly reachable, so a deleted photo whose URL still leaked would be a real privacy
+            // failure. Blanked exactly as Body is above. Dimensions/duration/mime are harmless metadata
+            // and left as-is. MediaPublicId is never projected — it is a server-only deletion handle.
+            MediaUrl = m.DeletedAt == null ? m.MediaUrl : null,
+            MediaThumbnailUrl = m.DeletedAt == null ? m.MediaThumbnailUrl : null,
+            MediaWidth = m.MediaWidth,
+            MediaHeight = m.MediaHeight,
+            MediaDurationMs = m.MediaDurationMs,
+            MediaMimeType = m.MediaMimeType,
+            // Document filename (M-M8) blanked for a tombstone IN SQL — its OWN CASE column, like the
+            // URLs and waveform. A filename (salary_negotiation_final.pdf) leaks meaning even when gone.
+            MediaFileName = m.DeletedAt == null ? m.MediaFileName : null,
+            // Voice waveform blanked for a tombstone IN SQL — a waveform left on a deleted voice note is
+            // a small leak, so it is scrubbed exactly like the URLs (its own CASE column, like the others).
+            MediaWaveform = m.DeletedAt == null ? m.MediaWaveform : null,
+            // Voice "played" receipts (M-M7), both caller-relative and resolved by correlated EXISTS
+            // subqueries in THIS same SELECT — no extra statement, no MessagePlays collection join (which
+            // would Cartesian-explode the page). playedByMe seeks the composite PK (MessageId, UserId);
+            // playedByOther seeks IX_MessagePlays_MessageId then filters UserId. Blanked for a tombstone,
+            // consistent with the media fields above.
+            PlayedByMe = m.DeletedAt == null &&
+                         _context.MessagePlays.Any(p => p.MessageId == m.Id && p.UserId == userId),
+            PlayedByOther = m.DeletedAt == null &&
+                            _context.MessagePlays.Any(p => p.MessageId == m.Id && p.UserId != userId),
             ReplyTo = m.ReplyToMessage == null
                 ? null
                 : new MessageReplyDto
@@ -253,6 +291,9 @@ public class ConversationRepository : IConversationRepository
                             ? m.ReplyToMessage.Body.Substring(0, 80)
                             : m.ReplyToMessage.Body),
                     Type = m.ReplyToMessage.Type,
+                    // Document filename of the quoted message (M-M8) — one more scalar on the SAME
+                    // replyTo LEFT JOIN (no extra statement). Blanked when the quote is a tombstone.
+                    FileName = m.ReplyToMessage.DeletedAt != null ? null : m.ReplyToMessage.MediaFileName,
                     IsDeleted = m.ReplyToMessage.DeletedAt != null
                 },
             Reactions = new List<MessageReactionSummaryDto>()   // attached in memory below
@@ -403,6 +444,13 @@ public class ConversationRepository : IConversationRepository
         _context.MessageDeletions.AsNoTracking()
             .AnyAsync(d => d.MessageId == messageId && d.UserId == userId, ct);
 
+    public async Task AddMessagePlayAsync(MessagePlay play) =>
+        await _context.MessagePlays.AddAsync(play);
+
+    public Task<bool> HasMessagePlayAsync(Guid messageId, Guid userId, CancellationToken ct = default) =>
+        _context.MessagePlays.AsNoTracking()
+            .AnyAsync(p => p.MessageId == messageId && p.UserId == userId, ct);
+
     public async Task AddAsync(Conversation conversation)
     {
         await _context.Conversations.AddAsync(conversation);
@@ -424,6 +472,7 @@ public class ConversationRepository : IConversationRepository
     {
         public Conversation Conversation { get; set; } = null!;
         public ConversationParticipant MyParticipant { get; set; } = null!;
+        public ConversationParticipant OtherParticipant { get; set; } = null!;
         public User OtherUser { get; set; } = null!;
         public Profile? OtherProfile { get; set; }
     }

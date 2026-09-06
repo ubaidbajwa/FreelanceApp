@@ -98,6 +98,12 @@ public interface IConversationRepository
     Task AddMessageDeletionAsync(MessageDeletion deletion);
     Task<bool> HasMessageDeletionAsync(Guid messageId, Guid userId, CancellationToken ct = default);
 
+    // Voice "played" receipts (M-M7)
+    Task AddMessagePlayAsync(MessagePlay play);
+
+    /// <summary>True if a play record already exists for (message, user) — drives idempotency and the "no duplicate event" branch.</summary>
+    Task<bool> HasMessagePlayAsync(Guid messageId, Guid userId, CancellationToken ct = default);
+
     // Unit-of-work style — Add* stage the entity; SaveChangesAsync commits (matches existing repos).
     Task AddAsync(Conversation conversation);
     Task AddMessageAsync(Message message);

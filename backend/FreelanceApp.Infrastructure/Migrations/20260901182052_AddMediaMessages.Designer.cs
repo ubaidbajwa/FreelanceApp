@@ -4,6 +4,7 @@ using System.Collections.Generic;
 using FreelanceApp.Infrastructure.Persistence;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Migrations;
 using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 using Npgsql.EntityFrameworkCore.PostgreSQL.Metadata;
 
@@ -12,9 +13,11 @@ using Npgsql.EntityFrameworkCore.PostgreSQL.Metadata;
 namespace FreelanceApp.Infrastructure.Migrations
 {
     [DbContext(typeof(AppDbContext))]
-    partial class AppDbContextModelSnapshot : ModelSnapshot
+    [Migration("20260901182052_AddMediaMessages")]
+    partial class AddMediaMessages
     {
-        protected override void BuildModel(ModelBuilder modelBuilder)
+        /// <inheritdoc />
+        protected override void BuildTargetModel(ModelBuilder modelBuilder)
         {
 #pragma warning disable 612, 618
             modelBuilder
@@ -325,10 +328,6 @@ namespace FreelanceApp.Infrastructure.Migrations
                     b.Property<int?>("MediaDurationMs")
                         .HasColumnType("integer");
 
-                    b.Property<string>("MediaFileName")
-                        .HasMaxLength(255)
-                        .HasColumnType("character varying(255)");
-
                     b.Property<int?>("MediaHeight")
                         .HasColumnType("integer");
 
@@ -350,10 +349,6 @@ namespace FreelanceApp.Infrastructure.Migrations
                     b.Property<string>("MediaUrl")
                         .HasMaxLength(500)
                         .HasColumnType("character varying(500)");
-
-                    b.Property<string>("MediaWaveform")
-                        .HasMaxLength(512)
-                        .HasColumnType("character varying(512)");
 
                     b.Property<int?>("MediaWidth")
                         .HasColumnType("integer");
@@ -416,27 +411,6 @@ namespace FreelanceApp.Infrastructure.Migrations
                     b.HasIndex("UserId");
 
                     b.ToTable("MessageDeletions", (string)null);
-                });
-
-            modelBuilder.Entity("FreelanceApp.Domain.Entities.MessagePlay", b =>
-                {
-                    b.Property<Guid>("MessageId")
-                        .HasColumnType("uuid");
-
-                    b.Property<Guid>("UserId")
-                        .HasColumnType("uuid");
-
-                    b.Property<DateTime>("PlayedAt")
-                        .HasColumnType("timestamp with time zone");
-
-                    b.HasKey("MessageId", "UserId");
-
-                    b.HasIndex("MessageId")
-                        .HasDatabaseName("IX_MessagePlays_MessageId");
-
-                    b.HasIndex("UserId");
-
-                    b.ToTable("MessagePlays", (string)null);
                 });
 
             modelBuilder.Entity("FreelanceApp.Domain.Entities.MessageReaction", b =>
@@ -791,23 +765,6 @@ namespace FreelanceApp.Infrastructure.Migrations
                     b.Navigation("Message");
                 });
 
-            modelBuilder.Entity("FreelanceApp.Domain.Entities.MessagePlay", b =>
-                {
-                    b.HasOne("FreelanceApp.Domain.Entities.Message", "Message")
-                        .WithMany("Plays")
-                        .HasForeignKey("MessageId")
-                        .OnDelete(DeleteBehavior.Cascade)
-                        .IsRequired();
-
-                    b.HasOne("FreelanceApp.Domain.Entities.User", null)
-                        .WithMany()
-                        .HasForeignKey("UserId")
-                        .OnDelete(DeleteBehavior.Restrict)
-                        .IsRequired();
-
-                    b.Navigation("Message");
-                });
-
             modelBuilder.Entity("FreelanceApp.Domain.Entities.MessageReaction", b =>
                 {
                     b.HasOne("FreelanceApp.Domain.Entities.Message", "Message")
@@ -865,8 +822,6 @@ namespace FreelanceApp.Infrastructure.Migrations
             modelBuilder.Entity("FreelanceApp.Domain.Entities.Message", b =>
                 {
                     b.Navigation("Deletions");
-
-                    b.Navigation("Plays");
 
                     b.Navigation("Reactions");
                 });

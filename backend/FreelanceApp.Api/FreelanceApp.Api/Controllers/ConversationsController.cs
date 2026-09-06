@@ -4,6 +4,7 @@ using FreelanceApp.Application.Features.Messaging.Services;
 using FreelanceApp.Application.Interfaces.Services;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.RateLimiting;
 
 namespace FreelanceApp.Api.Controllers;
 
@@ -84,6 +85,7 @@ public class ConversationsController(IChatService chatService) : ControllerBase
     // lifts Kestrel's default 30 MB cap to the 50 MB video limit; ChatService enforces the real per-kind
     // limits (10 MB image / 50 MB video), the allowed types, magic bytes, and the 120 s video duration.
     [HttpPost("{id:guid}/messages/media")]
+    [EnableRateLimiting("media")]                                    // 20 per hour per USER — upload abuse
     [RequestSizeLimit(52_428_800)]                                    // 50 MB
     [RequestFormLimits(MultipartBodyLengthLimit = 52_428_800)]       // 50 MB
     public async Task<IActionResult> SendMediaMessage(

@@ -45,4 +45,33 @@ public class MessageDto
     // Body is always empty; client renders the sentence from these two fields and SenderId.
     public SystemEventType? SystemEventType { get; set; }
     public Guid? SystemTargetMessageId { get; set; }
+
+    // ===== Media fields (M-M4, additive, nullable) — set only for Type Image/Video =====
+    // Body carries the caption (may be empty). MediaPublicId is deliberately NOT here — the public id
+    // is a server-only deletion handle and must never leak to a client. Width/Height let the client
+    // reserve layout space before the image loads so the message list doesn't jump. For a tombstone
+    // (IsDeleted) MediaUrl and MediaThumbnailUrl are blanked in SQL, exactly like Body.
+    public string? MediaUrl { get; set; }
+    public string? MediaThumbnailUrl { get; set; }
+    public int? MediaWidth { get; set; }
+    public int? MediaHeight { get; set; }
+    public int? MediaDurationMs { get; set; }
+    public string? MediaMimeType { get; set; }
+
+    // Document original filename (M-M8) — set only for Type File. The client shows this as the document's
+    // label (contract_final_v3.pdf) and renders an icon from its extension. Already sanitised server-side.
+    // Blanked (null) for a tombstone in SQL, like the URLs — a filename leaks meaning even when gone.
+    public string? MediaFileName { get; set; }
+
+    // Voice waveform (M-M6) — comma-separated amplitude samples (each 0–100, ≤64), computed by the
+    // client. Null for image/video, for a voice note with no samples, and for a tombstone (blanked in
+    // SQL like the URLs). The client renders a flat bar when null.
+    public string? MediaWaveform { get; set; }
+
+    // ===== Voice "played" receipts (M-M7, caller-relative) — meaningful only for Type Voice =====
+    // Resolved by correlated EXISTS subqueries in ProjectMessage (index seeks on MessagePlays), not a
+    // projected collection. Both are blanked (false) for a tombstone, like the media fields above.
+    // playedByMe: the caller has played this voice note. playedByOther: the other participant has.
+    public bool PlayedByMe { get; set; }
+    public bool PlayedByOther { get; set; }
 }

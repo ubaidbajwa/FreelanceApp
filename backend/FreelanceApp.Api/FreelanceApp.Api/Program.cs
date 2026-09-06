@@ -25,6 +25,9 @@ using FreelanceApp.Application.Features.Network.Services;
 using FreelanceApp.Application.Features.People.Services;
 using FreelanceApp.Application.Features.Messaging.Services;
 using System.Threading.RateLimiting;
+using System.Diagnostics;
+using System.Globalization;
+using Microsoft.AspNetCore.Mvc;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -340,46 +343,88 @@ builder.Services.AddCors(options =>
     });
 });
 
-// Rate limiting — brute-force protection on auth endpoints
-// Per-IP fixed window: 10 requests/minute covers a legit signup flow
-// (register → verify-email → resend-otp) while blocking credential stuffing.
+// Rate limiting — brute-force / abuse protection. Limits are bound from the "RateLimiting" section
+// (RateLimitSettings) so they can be tuned without a redeploy. Unauthenticated endpoints partition
+// by client IP; authenticated ones by user id — an office/university behind one NAT must not throttle
+// each other, and that is exactly Skillora's user base. Fixed window (a hard ceiling per period),
+// never token bucket. Rejections are RFC 7807 problem+json with a Retry-After header, matching
+// GlobalExceptionHandler. The SignalR hub is never limited (see the global limiter below).
+var rateLimitSettings = builder.Configuration
+    .GetSection(RateLimitSettings.SectionName)
+    .Get<RateLimitSettings>() ?? new RateLimitSettings();
+builder.Services.Configure<RateLimitSettings>(
+    builder.Configuration.GetSection(RateLimitSettings.SectionName));
+
 builder.Services.AddRateLimiter(options =>
 {
     options.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
 
     options.OnRejected = async (context, ct) =>
     {
-        context.HttpContext.Response.ContentType = "application/problem+json";
-        await context.HttpContext.Response.WriteAsJsonAsync(new
+        var response = context.HttpContext.Response;
+
+        // Retry-After: fixed-window limiters expose the remaining window as metadata. Surface it as
+        // the standard header so a well-behaved client backs off exactly as long as it must.
+        int? retryAfterSeconds = null;
+        if (context.Lease.TryGetMetadata(MetadataName.RetryAfter, out var retryAfter))
         {
-            status = 429,
-            title = "Too Many Requests",
-            detail = "Too many attempts. Please wait a minute and try again."
-        }, ct);
+            retryAfterSeconds = (int)Math.Ceiling(retryAfter.TotalSeconds);
+            response.Headers.RetryAfter = retryAfterSeconds.Value.ToString(CultureInfo.InvariantCulture);
+        }
+
+        // RFC 7807 body, same shape GlobalExceptionHandler emits for every other error.
+        var problem = new ProblemDetails
+        {
+            Status = StatusCodes.Status429TooManyRequests,
+            Title = "Too Many Requests",
+            Detail = retryAfterSeconds is int s
+                ? $"Rate limit exceeded. Please retry after {s} seconds."
+                : "Rate limit exceeded. Please slow down and try again shortly.",
+            Type = "https://httpstatuses.com/429",
+            Instance = context.HttpContext.Request.Path
+        };
+        problem.Extensions["traceId"] = Activity.Current?.Id ?? context.HttpContext.TraceIdentifier;
+
+        response.StatusCode = StatusCodes.Status429TooManyRequests;
+        response.ContentType = "application/problem+json";
+        await response.WriteAsJsonAsync(problem, ct);
     };
 
-    options.AddPolicy("auth", httpContext =>
+    // Pre-auth endpoints — partitioned by client IP (no user identity yet).
+    RateLimitPartition<string> ByIp(HttpContext ctx, RateLimitPolicy p) =>
         RateLimitPartition.GetFixedWindowLimiter(
-            partitionKey: httpContext.Connection.RemoteIpAddress?.ToString() ?? "unknown",
-            factory: _ => new FixedWindowRateLimiterOptions
-            {
-                PermitLimit = 10,
-                Window = TimeSpan.FromMinutes(1),
-                QueueLimit = 0
-            }));
+            ctx.Connection.RemoteIpAddress?.ToString() ?? "unknown",
+            _ => new FixedWindowRateLimiterOptions { PermitLimit = p.PermitLimit, Window = p.Window, QueueLimit = 0 });
 
-    // OTP endpoints (resend-otp, forgot-password) har call pe email bhejte hain —
-    // 10/min bohat loose tha (email bombing + SMTP quota burn). 3 per 5 min kaafi hai:
-    // legit user ek-do resend hi karta hai, attacker ruk jata hai.
-    options.AddPolicy("otp", httpContext =>
+    // Authenticated endpoints — partitioned by user id (falls back to IP if the claim is missing).
+    RateLimitPartition<string> ByUser(HttpContext ctx, RateLimitPolicy p) =>
         RateLimitPartition.GetFixedWindowLimiter(
-            partitionKey: httpContext.Connection.RemoteIpAddress?.ToString() ?? "unknown",
-            factory: _ => new FixedWindowRateLimiterOptions
-            {
-                PermitLimit = 3,
-                Window = TimeSpan.FromMinutes(5),
-                QueueLimit = 0
-            }));
+            ctx.User.FindFirst("sub")?.Value ?? ctx.Connection.RemoteIpAddress?.ToString() ?? "unknown",
+            _ => new FixedWindowRateLimiterOptions { PermitLimit = p.PermitLimit, Window = p.Window, QueueLimit = 0 });
+
+    options.AddPolicy("login", ctx => ByIp(ctx, rateLimitSettings.Login));
+    options.AddPolicy("register", ctx => ByIp(ctx, rateLimitSettings.Register));
+    options.AddPolicy("forgot-password", ctx => ByIp(ctx, rateLimitSettings.ForgotPassword));
+    options.AddPolicy("otp", ctx => ByIp(ctx, rateLimitSettings.Otp));   // verify / resend OTP
+    options.AddPolicy("media", ctx => ByUser(ctx, rateLimitSettings.Media));
+
+    // Global ceiling on everything else — per user when authenticated, per IP when anonymous. The
+    // SignalR hub is exempt: a long-lived WebSocket is ONE connection, not repeated requests, and
+    // throttling reconnects would break recovery on flaky networks exactly when it matters most.
+    options.GlobalLimiter = PartitionedRateLimiter.Create<HttpContext, string>(ctx =>
+    {
+        if (ctx.Request.Path.StartsWithSegments("/hubs"))
+            return RateLimitPartition.GetNoLimiter("hub");
+
+        var userId = ctx.User.FindFirst("sub")?.Value;
+        return userId is not null
+            ? RateLimitPartition.GetFixedWindowLimiter($"user:{userId}",
+                _ => new FixedWindowRateLimiterOptions
+                { PermitLimit = rateLimitSettings.Authenticated.PermitLimit, Window = rateLimitSettings.Authenticated.Window, QueueLimit = 0 })
+            : RateLimitPartition.GetFixedWindowLimiter($"ip:{ctx.Connection.RemoteIpAddress?.ToString() ?? "unknown"}",
+                _ => new FixedWindowRateLimiterOptions
+                { PermitLimit = rateLimitSettings.Anonymous.PermitLimit, Window = rateLimitSettings.Anonymous.Window, QueueLimit = 0 });
+    });
 });
 
 var app = builder.Build();
@@ -404,14 +449,16 @@ if (!app.Environment.IsDevelopment())
 // 1. Pehle Routing aayegi
 app.UseRouting();
 
-// 2. Rate limiter — routing ke baad taake endpoint policies match ho sakein
-app.UseRateLimiter();
-
-// 3. Phir CORS aayega
+// 2. Phir CORS aayega
 app.UseCors("AllowFrontend");
 
-// 4. Phir Authentication aayegi
+// 3. Phir Authentication aayegi
 app.UseAuthentication();
+
+// 4. Rate limiter — AFTER authentication so authenticated policies (media, global ceiling) can
+//    partition by user id (User is populated only after UseAuthentication). Pre-auth policies
+//    (login/register/otp) partition by IP and are unaffected by the ordering.
+app.UseRateLimiter();
 
 // 5. Phir Authorization aayegi
 app.UseAuthorization();

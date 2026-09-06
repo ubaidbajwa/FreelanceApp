@@ -177,6 +177,144 @@ Both are `DateTime.UtcNow - message.CreatedAt` checks **in `ChatService`**, not 
 
 ---
 
+## 7. Media messages (M-M4): image/video, one-request upload, reuse of the single write path
+
+**Decision:** Images and videos are real message types (`MessageType.Image = 1`, `MessageType.Video = 5`), sent through **one** multipart endpoint (`POST /api/conversations/{id}/messages/media`) that uploads to Cloudinary **and** creates the message in the same request. Eight nullable `Media*` columns were added to `Message` in one additive migration (`AddMediaMessages`). Load-bearing sub-decisions:
+
+### 7a. `Video = 5`, not 4 — 4 is `System`
+
+`System = 4` was assigned in M1.2. Reusing 4 for `Video` would silently re-type every existing pin/unpin row. `Video` therefore takes the next free value, **5**. `Image = 1` was already reserved in M1.
+
+### 7b. One request (upload-then-create together), not a separate upload endpoint
+
+A separate "upload first, send later" endpoint orphans a Cloudinary file whenever a user picks an image and then backs out — the same lesson the deferred profile-photo flow already learned ("commit on submit"). A single request means **a file exists only if a message exists**.
+
+### 7c. Media flows through `SendCoreAsync` — it cannot skip rule (c)
+
+Media send reuses the exact text write path (`SendCoreAsync`), so it inherits the participant gate, the declined check, the pending 1-message rule (c), persist-then-notify, and the request-received push. To keep "no orphan on a rejected send", the Cloudinary upload is **deferred**: `SendMediaMessageAsync` passes a `mediaFactory` that `SendCoreAsync` invokes **only after** those gates pass. An unauthorized send therefore never uploads. A **forward** passes a factory that returns the *source* message's media, so a forwarded media message **reuses the same `MediaUrl` + `MediaPublicId`** — a reference, not a re-upload.
+
+### 7d. Validate before upload; duration is the one check that can't be
+
+Type, size, and **magic bytes** are validated locally before any Cloudinary call — the declared MIME is verified against the file's leading signature (a renamed `.jpg` can't pass). Limits (10 MB image / 50 MB video / 120 s) live as named constants in `ChatService` beside `EditWindow`/`PinWindow*`. **Duration is the exception:** with no ffmpeg (explicitly out of scope), duration is only known from Cloudinary's upload result. So an over-length video is rejected **after** upload, and the just-uploaded (still unreferenced) asset is deleted — no orphan, no over-length video stored. This is the only case where a rejected file reaches Cloudinary.
+
+### 7e. Thumbnails are Cloudinary URL transformations — no server-side processing
+
+No ffmpeg, no generated files. The client shows a small thumbnail in the bubble and the full asset only when opened:
+- **Image thumbnail:** `c_fill,w_400,q_auto` injected after `/image/upload/`.
+- **Video poster:** `so_0,w_400,c_fill` injected after `/video/upload/`, extension swapped to `.jpg`.
+
+### 7f. Preview label is localised on the client via `lastMessageType`
+
+An uncaptioned photo has an empty `Body`, so the conversation-list preview would be blank. Rather than store `"📷 Photo"` server-side (untranslatable — Skillora targets every country, the same mistake M1.2 avoided for system messages), `ConversationSummaryDto` gains `lastMessageType` (resolved by one more correlated subquery in the **same** list statement — no extra round-trip) and the client renders its own localised "Photo"/"Video".
+
+### 7g. A tombstone blanks the media URLs, exactly like the body
+
+Delete-for-everyone blanks `MediaUrl`/`MediaThumbnailUrl` **in SQL** in the message projection (`CASE WHEN "DeletedAt" IS NULL THEN "MediaUrl"`), same as `Body`. A Cloudinary URL is publicly reachable, so a deleted photo whose URL still leaked would be a real privacy failure. `MediaPublicId` is **never** projected — it is a server-only deletion handle.
+
+### 7h. Assets are never deleted in this slice — reference counting is required first
+
+Because a forward shares `MediaPublicId`, deleting the asset on one copy's delete-for-everyone would break the others. No asset deletion ships here; orphan cleanup needs reference counting on `MediaPublicId`. Tracked in `docs/TODO.md` with the storage-cost trigger.
+
+### 7i. Uploads pass through the API — acceptable now, with a known revisit
+
+The upload streams **through the API**, tying up a request thread for the duration of a (up to 50 MB) video — consistent with the existing KYC and profile-photo paths, and acceptable at this scale. **Revisit trigger:** sustained upload volume, or larger size limits. **Migration path:** signed **direct-to-Cloudinary** uploads — the client uploads straight to Cloudinary and the API only issues an upload signature, then creates the message from the returned public id. `IMediaStorageService` is the seam that changes; the message write path is unaffected.
+
+**Query-shape note:** the media columns are additional **scalar** columns in the single message-page `SELECT` (with the tombstone-blank `CASE` for the two URLs); `lastMessageType` is one more correlated subquery in the single list `SELECT`. Neither adds a statement — `GetMessagesAsync` stays **two** statements (page projection + reactions aggregate). Guarded by `MessageQueryShapeTests`.
+
+**Out of scope (unchanged):** file message type, client-side crop/markup, signed direct uploads, asset deletion / reference counting.
+
+## 8. Voice notes (M-M6): audio reuses the media path; the waveform is computed by the client
+
+**Decision:** A voice note is `MessageType.Voice` (the value reserved since M1). It reuses the **entire** M-M4 media path — the same `POST .../messages/media` endpoint, the same `SendCoreAsync` write path, the same deferred-upload/rule-(c) discipline, the same validate-before-upload and delete-on-over-duration behaviour. Audio is not a parallel upload path; it is one more `MediaKind`. Only **one** new column was added (`MediaWaveform`, one additive migration `AddVoiceWaveform`). Load-bearing sub-decisions:
+
+### 8a. The waveform is computed by the CLIENT, not the server
+
+A voice bubble draws a waveform rather than a blank bar, so it needs amplitude data. Extracting it server-side means **decoding the audio — ffmpeg** — which was ruled out in M-M4 for exactly the reason it is ruled out here: no server-side media processing. But the mobile recorder **already exposes amplitude while recording**, so the client has the data for free and simply sends it. The server only **validates and stores** it: comma-separated integers, each `0–100`, **at most 64 samples** (enough resolution for a bubble a few cm wide, and it bounds the `varchar(512)` column so a client can't push thousands of points). A malformed value is a **400** — the shape is validated in `ChatService` beside the file checks, so the whole media write path is validated in one place. `null` is valid (the client falls back to a flat bar). This mirrors 7f (`lastMessageType`): the server stores structured data, the client renders the human-facing form.
+
+### 8b. Audio has no distinct Cloudinary resource type — it is stored as "video"
+
+Cloudinary has no `audio` resource type; audio lives under **`resource_type=video`**. `UploadAudioAsync` therefore uses `VideoUploadParams` (which sets that), and `DeleteAsync` maps `MediaKind.Audio → ResourceType.Video` so an over-length voice note's just-uploaded asset is deleted correctly. The app still models `Audio` as its own `MediaKind` so a `Voice` message is never confused with a `Video`. No thumbnail and no width/height are stored for voice (`MediaThumbnailUrl`/`MediaWidth`/`MediaHeight` stay `null`); duration follows the 7d rule — known only after upload, so an over-300 s note is rejected post-upload and its asset deleted.
+
+### 8c. m4a and mp4 share the `ftyp` signature — the declared MIME decides the kind, not the bytes
+
+An `.m4a` (audio) and an `.mp4` (video) both begin with the `ftyp` box at offset 4, so their magic-byte checks look alike. The **kind is decided by the declared MIME** (checked against `AllowedAudioTypes` vs `AllowedVideoTypes`), and the signature only **confirms the container is plausible** — it is never used to infer audio-vs-video. So a video declared `video/mp4` goes to the video path and an m4a declared `audio/mp4` to the audio path; neither can be misrouted by the shared signature. A cross-type payload whose container differs (e.g. an OGG declared `video/mp4`, or an mp4 declared `audio/ogg`) is still caught, because its signature won't match the declared type's branch.
+
+### 8d. The waveform is a tombstone-blanked column, like the URLs
+
+Delete-for-everyone blanks `MediaWaveform` in the same in-SQL `CASE` treatment as `MediaUrl`/`MediaThumbnailUrl` — a waveform left on a deleted voice note is a small leak, but it is still a leak. It is its **own** `CASE ... ELSE NULL END` output column, so `GetMessagesAsync` stays **two** statements (verified by a `ToQueryString()` dump: three separate media `CASE` columns, one page `SELECT`, plus the reactions aggregate). Edit is refused for `Voice` (the M-M4 media edit-guard now covers `Image`/`Video`/`Voice`); a forward reuses the same `MediaUrl` + `MediaPublicId` **and** `MediaWaveform`, no re-upload; `lastMessageType` returns `Voice` and the client renders its own localised label; a reply to a voice note carries `replyTo.type = Voice` with an empty snippet (no caption), same client-localised rule as media previews and system messages.
+
+**Out of scope (M-M6):** transcription, playback-speed metadata, and file/document sharing (a later slice). *(Voice "played" receipts shipped in M-M7 — see §9.)*
+
+---
+
+## 9. Voice "played" receipts (M-M7): a dedicated `MessagePlay` table, not derived from `LastReadAt`
+
+**Decision:** Whether a voice note has been played is tracked by its own per-user join table, `MessagePlay { MessageId, UserId, PlayedAt }` (composite PK, one additive migration `AddMessagePlays`), **not** derived from the conversation read watermark. A `POST /api/conversations/{id}/messages/{messageId}/played` endpoint inserts one row; `MessageDto` gains two caller-relative booleans — `playedByMe` (the caller played it) and `playedByOther` (the other participant did).
+
+**Why `LastReadAt` is not a valid proxy (§4 read-vs-played distinction):** the `LastReadAt` watermark records that the **conversation was read up to a timestamp** — a viewport/scroll fact. It says nothing about whether a *specific* voice note was ever played. Someone can open a chat, read the text, and never tap play; deriving "played" from the read watermark would show a **false played receipt**. For a voice note that receipt is a claim the other person actually *listened* — a stronger signal than "seen", and one users take seriously — so it needs its own record. This is the same reasoning as §4 (a watermark can't express per-item state) applied one level finer: read is per-conversation, played is per-(message, user).
+
+**Load-bearing sub-decisions:**
+
+- **Composite PK ⇒ idempotency for free.** One row per (message, user), so marking a note played twice is a natural no-op (the row already exists) rather than a guarded upsert. `ChatService.MarkPlayedAsync` checks `HasMessagePlayAsync` first: if a row exists it returns immediately and **fires no event** — a repeat call from the client must not push a duplicate `MessagePlayed`. The event is dispatched only on the branch where a new row was actually inserted. Mirrors `MessageDeletion`'s config exactly (FK→Message Cascade, FK→User Restrict, `IX_MessagePlays_MessageId`).
+
+- **Endpoint rules.** Participant only (else 403); unknown message 404; non-`Voice` type 400 (marking a text message played is meaningless — reject surfaces a client bug); the **sender** marking their own note 400 (a sender must not be able to manufacture their own played receipt); a tombstoned message 400; idempotent second call is a no-op.
+
+- **Two flags without a third statement.** `playedByMe` / `playedByOther` are two correlated `EXISTS` subqueries **inside** the existing message-page `SELECT` — the same technique as `isPinned` and the delete-for-me exclusion. `playedByMe` seeks the composite PK; `playedByOther` seeks `IX_MessagePlays_MessageId` then filters `UserId <> caller`. They are **not** attached as a separate aggregate (that would be a third statement) and **not** projected as a `MessagePlay` collection (that would Cartesian-explode the page). `GetMessagesAsync` therefore stays **two** statements (page projection + reactions aggregate), verified by a `ToQueryString()` guard in `MessageQueryShapeTests` (asserts `MessagePlays` appears only via `EXISTS`, never a JOIN, and no window function). Both flags are blanked for a tombstone (`DeletedAt IS NULL AND EXISTS(...)`), consistent with `Body`, the media URLs, and `MediaWaveform`.
+
+- **Realtime fires to the sender only.** `MessagePlayed { conversationId, messageId }` is a new `IChatNotifier` method (Application never references SignalR), sent to the **sender** — they are the one whose bubble's mic badge changes; the player already knows they pressed play. Persist-first, then notify; a notifier failure logs a warning and does not fail the request (a client refetch recovers the flag).
+
+**Out of scope (M-M7):** played receipts for images/video (only voice), a "played at" timestamp in any UI, the `ReadReceiptsEnabled` privacy toggle (deferred in `docs/TODO.md`, now covering read **and** played symmetrically), and any Flutter change.
+
+**Revisit trigger:** played receipts are wanted for other media types, or a "played at" time is surfaced in the UI — both are additive (the row already stores `PlayedAt`; the type gate widens).
+
+---
+
+## 10. Documents (M-M8): the reserved `File = 2`, an allowlist, and honest validation limits
+
+**Decision:** Document sharing (PDF, Office, text/csv) reuses the **entire** M-M4 media path — the same `POST .../messages/media` endpoint (with an added `fileName` field), the same `SendCoreAsync` write path, the same deferred-upload/rule-(c) discipline, the same media rate-limit policy (S1's 20/hour per user). A document is `MessageType.File` — the value **reserved since M1** — and one more `MediaKind` (`Document → Cloudinary resource_type=raw`). One additive column was added (`MediaFileName`, migration `AddMessageFileName`). Load-bearing sub-decisions:
+
+### 10a. An allowlist, never a blocklist; `.zip` is deliberately excluded
+
+Nine extensions are allowed: `.pdf .docx .xlsx .pptx .doc .xls .ppt .txt .csv`, each pinned to the ONE declared MIME consistent with it. Anything not listed is rejected. A blocklist of "dangerous" extensions is **not** the primary control: a blocklist is the set of things we happened to think of, and the attacker's job is to find one we didn't — an allowlist inverts that burden. `.zip` is excluded on purpose: a zip is a container that can hold anything, so allowing it makes the whole allowlist meaningless — constraining the contents would mean unzipping, which we refuse (that is exactly how zip bombs work). Recorded here so nobody re-adds it thinking it an oversight.
+
+### 10b. Three validation layers, none sufficient alone — and the magic-byte family limit
+
+Extension (Layer 1) and declared MIME (Layer 2) are both client-supplied and forgeable; the MIME must be consistent with the extension (a `.pdf` declared `text/plain` is rejected regardless of its bytes). Layer 3 is magic bytes, and it is implemented **honestly**: `.docx/.xlsx/.pptx` are all zip archives (`PK\x03\x04`, plus the empty `PK\x05\x06` and spanned `PK\x07\x08` variants, accepted as zip-family), so the signature can confirm "this is the zip family" but **never** "this is specifically a Word document". `.doc/.xls/.ppt` are all OLE2 compound files (`D0 CF 11 E0 A1 B1 1A E1`) and likewise indistinguishable from one another. So the rule is **family-level agreement**: the signature must place the file in the family the extension implies. We deliberately do **not** unzip to inspect `[Content_Types].xml` — decompressing attacker-supplied archives is the zip-bomb attack, and the extra precision isn't worth exposing a decompressor to hostile input. `%PDF-` (`25 50 44 46 2D`) is the one signature that proves a specific type.
+
+### 10c. txt/csv have no signature — a bounded heuristic, and its weakness
+
+Plain text has nothing to match, so `.txt/.csv` use a bounded **heuristic, not a guarantee**: read at most the first **8 KB** (never the whole file), reject a null byte (the clearest binary marker), reject if >30 % of bytes are non-printable control characters, and reject anything that does not decode as UTF-8 (ASCII is a subset). A crafted file **can** pass this — it is acceptable only because a `.txt/.csv` is never executed, only stored and served. This is stated in a code comment on `IsPlausibleText` as well.
+
+### 10d. Type detection is a filter, not a proof — the real defences are downstream
+
+A file is a byte sequence; its "type" is a convention, not a property of the bytes, and a polyglot can be a valid PDF *and* a valid archive at once. Detection is therefore a filter, never a proof. The real defences are downstream: **the server never executes or parses the file** — it stores and serves bytes; documents are stored as **Cloudinary `raw`**, so no image/document transformation pipeline ever touches attacker-supplied bytes; and the client must never auto-open a download with elevated trust — it hands off to the OS, which applies its own sandboxing.
+
+### 10e. Validation is entirely local — a document never reaches Cloudinary and is then deleted
+
+Every document check (extension, MIME, size, magic bytes, text heuristic) is local, so a rejected document never reaches Cloudinary — unlike video/voice duration, which is only knowable *after* upload (7d), a document has no post-upload check, so there is **no upload-then-delete** path for documents. The deferred-upload factory still runs the participant/declined/rule-(c) gates before the upload, so an unauthorized send never uploads either.
+
+### 10f. Size limit 25 MB
+
+A named constant beside the image (10 MB), video (50 MB) and audio (10 MB) limits. Uploads pass **through** the API (§7i), so each upload holds a request thread for its duration — a larger cap multiplies that across concurrent users. On a mobile link 25 MB is already a slow upload; a higher cap makes failure likelier, not the feature more capable. It also bounds abuse alongside the per-user media rate limit. The **declared content length** is checked *before* the file is read, so a 500 MB upload is rejected early rather than buffered first (buffering it to discover it is too large is itself the attack).
+
+### 10g. The filename is untrusted input — sanitised, with the validated extension forced
+
+Documents need their original name (`contract_final_v3.pdf` *is* the content to the user), stored in the new `MediaFileName` (max 255). It is sanitised before storage: strip every path component (so `../../etc/passwd.pdf` becomes `passwd.pdf`); strip null bytes and control characters; strip bidirectional-override / directional-format characters (U+202A–202E, U+2066–2069, U+200E/200F) — a genuine spoof, since an RTL override makes `report<U+202E>fdp.exe` render to the eye as `reportexe.pdf`; Skillora has real RTL users, so we **strip the control characters while preserving legitimate Arabic/Urdu letters**, not reject non-Latin names. Truncate to 255 preserving the extension; if empty after sanitising, fall back to a generated stem. The stored extension is **always** the validated type, never whatever the user typed.
+
+### 10h. Cloudinary `raw` mapping — and delete parity
+
+`Document → RawUploadParams` (`resource_type=raw`) on upload; `DeleteAsync` maps `MediaKind.Document → ResourceType.Raw` so a delete passes the **same** resource type the asset was uploaded under (Cloudinary silently no-ops a delete on a resource-type mismatch, leaving an orphan with no error). This is the same map extended, not a parallel one (M6 added `Audio → Video`). No thumbnail, dimensions, duration or waveform are stored for a document (`MediaThumbnailUrl`/`MediaWidth`/`MediaHeight`/`MediaDurationMs`/`MediaWaveform` stay `null`) — Cloudinary *can* render a PDF's first page, but only by uploading it as an `image` resource, which would put attacker-supplied files through the image pipeline; not worth it, so the client renders an icon from the extension.
+
+### 10i. Interaction with existing features
+
+A tombstone blanks both `MediaUrl` **and** `MediaFileName` in the projection (its own in-SQL `CASE` column, like the URLs/waveform) — a filename (`salary_negotiation_final.pdf`) leaks meaning even when the file is gone; `replyTo.fileName` carries the quoted document's name (one more scalar on the existing replyTo LEFT JOIN — no extra statement; `GetMessagesAsync` stays **two** statements, verified by the `ToQueryString()` dump); a forward reuses the same `MediaUrl`/`MediaPublicId`/`MediaFileName`, no re-upload; edit is refused for `File` (the media edit-guard now covers `Image/Video/Voice/File`); a caption is allowed (held in `Body`, empty valid); played receipts remain voice-only (a document is rejected there); `lastMessageType` returns `File` and the client renders its own localised label (no server-side "Document" string).
+
+**Out of scope (M-M8):** zip/archive support (10a); virus scanning; signed/expiring download URLs; document previews or in-app rendering; any Flutter change. Virus scanning and signed delivery are tracked in `docs/TODO.md`, each with its trigger.
+
+**Revisit trigger:** signed/expiring download URLs before any public launch (a Cloudinary `raw` URL is publicly reachable by anyone holding the link — far more sensitive for a contract than a chat photo); virus scanning before documents are exchanged with parties outside a user's connections.
+
+---
+
 ## Notes
 
 - **Backplane and read-model are the two most likely first revisits** — the backplane the moment a second instance is deployed, the read-model if per-message receipts are demanded by group chat.

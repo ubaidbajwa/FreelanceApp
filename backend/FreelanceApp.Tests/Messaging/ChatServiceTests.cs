@@ -19,12 +19,21 @@ public class ChatServiceTests
     private static (ChatService sut, FakeConversationRepository convs, FakeUserRepository users, RecordingChatNotifier notifier)
         Build(Guid? caller = null)
     {
+        var (sut, convs, users, _, notifier) = BuildAll(caller);
+        return (sut, convs, users, notifier);
+    }
+
+    // Same as Build but also surfaces the media fake — used by the M-M4 media tests.
+    private static (ChatService sut, FakeConversationRepository convs, FakeUserRepository users, FakeMediaStorageService media, RecordingChatNotifier notifier)
+        BuildAll(Guid? caller = null)
+    {
         var convs = new FakeConversationRepository();
         var users = new FakeUserRepository();
         var notifier = new RecordingChatNotifier();
+        var media = new FakeMediaStorageService();
         var current = new FakeCurrentUser { UserId = caller ?? Me };
-        var sut = new ChatService(convs, users, notifier, current, NullLogger<ChatService>.Instance);
-        return (sut, convs, users, notifier);
+        var sut = new ChatService(convs, users, notifier, current, media, NullLogger<ChatService>.Instance);
+        return (sut, convs, users, media, notifier);
     }
 
     private static Conversation Conv(Guid initiator, Guid other, ConversationStatus status)
@@ -126,11 +135,11 @@ public class ChatServiceTests
         var notifier = new RecordingChatNotifier();
 
         var meService = new ChatService(convs, users, notifier,
-            new FakeCurrentUser { UserId = Me }, NullLogger<ChatService>.Instance);
+            new FakeCurrentUser { UserId = Me }, new FakeMediaStorageService(), NullLogger<ChatService>.Instance);
         var first = await meService.StartOrGetConversationAsync(Other);
 
         var otherService = new ChatService(convs, users, notifier,
-            new FakeCurrentUser { UserId = Other }, NullLogger<ChatService>.Instance);
+            new FakeCurrentUser { UserId = Other }, new FakeMediaStorageService(), NullLogger<ChatService>.Instance);
         var second = await otherService.StartOrGetConversationAsync(Me);
 
         Assert.Equal(first.Id, second.Id);   // get-or-create is direction-agnostic
@@ -168,8 +177,8 @@ public class ChatServiceTests
         var conv = Conv(Me, Other, ConversationStatus.Pending);
         convs.Conversations.Add(conv);
 
-        var meSvc = new ChatService(convs, users, notifier, new FakeCurrentUser { UserId = Me }, NullLogger<ChatService>.Instance);
-        var otherSvc = new ChatService(convs, users, notifier, new FakeCurrentUser { UserId = Other }, NullLogger<ChatService>.Instance);
+        var meSvc = new ChatService(convs, users, notifier, new FakeCurrentUser { UserId = Me }, new FakeMediaStorageService(), NullLogger<ChatService>.Instance);
+        var otherSvc = new ChatService(convs, users, notifier, new FakeCurrentUser { UserId = Other }, new FakeMediaStorageService(), NullLogger<ChatService>.Instance);
 
         var mine = await meSvc.GetConversationAsync(conv.Id);
         Assert.Equal(conv.Id, mine.Id);
@@ -400,6 +409,1085 @@ public class ChatServiceTests
         Assert.Equal(msg.Id, pushed.message.Id);       // then notified with that saved message
     }
 
+    // ===== MEDIA (M-M4) =====
+
+    private static readonly byte[] Jpeg = { 0xFF, 0xD8, 0xFF, 0xE0, 0, 0, 0, 0, 0, 0, 0, 0 };
+    private static readonly byte[] Png  = { 0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 0 };
+    private static readonly byte[] Gif  = { 0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 0, 0, 0, 0, 0, 0 };
+    private static readonly byte[] Webp = { 0x52, 0x49, 0x46, 0x46, 0, 0, 0, 0, 0x57, 0x45, 0x42, 0x50 };
+    private static readonly byte[] Mp4  = { 0, 0, 0, 0x18, 0x66, 0x74, 0x79, 0x70, 0x6D, 0x70, 0x34, 0x32 };
+    private static readonly byte[] Webm = { 0x1A, 0x45, 0xDF, 0xA3, 0, 0, 0, 0, 0, 0, 0, 0 };
+    private static readonly byte[] Mov  = { 0, 0, 0, 0x14, 0x66, 0x74, 0x79, 0x70, 0x71, 0x74, 0x20, 0x20 };
+
+    private static MediaUploadInput Input(string contentType, byte[] bytes, long? length = null) =>
+        new() { Content = new MemoryStream(bytes), FileName = "f", ContentType = contentType, Length = length ?? bytes.Length };
+
+    private static SendMediaMessageRequestDto MediaReq(string? caption = null, Guid? replyTo = null) =>
+        new() { Caption = caption, ReplyToMessageId = replyTo };
+
+    [Theory]
+    [InlineData("image/jpeg")]
+    [InlineData("image/png")]
+    [InlineData("image/webp")]
+    [InlineData("image/gif")]
+    public async Task SendMedia_AcceptedImageType_CreatesImageMessage_CaptionAsBody(string contentType)
+    {
+        var (sut, convs, _, media, _) = BuildAll();
+        var conv = Conv(Me, Other, ConversationStatus.Accepted);
+        convs.Conversations.Add(conv);
+        var bytes = contentType switch { "image/jpeg" => Jpeg, "image/png" => Png, "image/webp" => Webp, _ => Gif };
+
+        var msg = await sut.SendMediaMessageAsync(conv.Id, MediaReq(caption: "look here"), Input(contentType, bytes));
+
+        Assert.Equal(MessageType.Image, msg.Type);
+        Assert.Equal("look here", msg.Body);                 // caption stored as Body
+        Assert.Equal(media.ImageResult.SecureUrl, msg.MediaUrl);
+        Assert.Equal(media.ImageResult.ThumbnailUrl, msg.MediaThumbnailUrl);
+        Assert.Equal(800, msg.MediaWidth);
+        Assert.Equal(600, msg.MediaHeight);
+        Assert.Equal(1, media.ImageUploads);
+        Assert.Single(convs.Messages);
+    }
+
+    [Theory]
+    [InlineData("video/mp4")]
+    [InlineData("video/webm")]
+    [InlineData("video/quicktime")]
+    public async Task SendMedia_AcceptedVideoType_CreatesVideoMessage_EmptyCaptionAllowed(string contentType)
+    {
+        var (sut, convs, _, media, _) = BuildAll();
+        var conv = Conv(Me, Other, ConversationStatus.Accepted);
+        convs.Conversations.Add(conv);
+        var bytes = contentType switch { "video/mp4" => Mp4, "video/webm" => Webm, _ => Mov };
+
+        var msg = await sut.SendMediaMessageAsync(conv.Id, MediaReq(caption: null), Input(contentType, bytes));
+
+        Assert.Equal(MessageType.Video, msg.Type);
+        Assert.Equal(string.Empty, msg.Body);                // empty caption allowed for media
+        Assert.Equal(5000, msg.MediaDurationMs);
+        Assert.Equal(1, media.VideoUploads);
+    }
+
+    [Fact]
+    public async Task SendMedia_OversizeImage_Rejected_NamingLimit_NoUpload()
+    {
+        var (sut, convs, _, media, _) = BuildAll();
+        var conv = Conv(Me, Other, ConversationStatus.Accepted);
+        convs.Conversations.Add(conv);
+
+        var ex = await Assert.ThrowsAsync<ValidationException>(() =>
+            sut.SendMediaMessageAsync(conv.Id, MediaReq(), Input("image/jpeg", Jpeg, length: ChatService.MaxImageBytes + 1)));
+
+        Assert.Equal(400, ex.StatusCode);
+        Assert.Contains("10 MB", ex.Message);
+        Assert.Equal(0, media.ImageUploads);                 // rejected before reaching Cloudinary
+        Assert.Empty(convs.Messages);
+    }
+
+    [Fact]
+    public async Task SendMedia_OversizeVideo_Rejected_NamingLimit_NoUpload()
+    {
+        var (sut, convs, _, media, _) = BuildAll();
+        var conv = Conv(Me, Other, ConversationStatus.Accepted);
+        convs.Conversations.Add(conv);
+
+        var ex = await Assert.ThrowsAsync<ValidationException>(() =>
+            sut.SendMediaMessageAsync(conv.Id, MediaReq(), Input("video/mp4", Mp4, length: ChatService.MaxVideoBytes + 1)));
+
+        Assert.Equal(400, ex.StatusCode);
+        Assert.Contains("50 MB", ex.Message);
+        Assert.Equal(0, media.VideoUploads);
+    }
+
+    [Fact]
+    public async Task SendMedia_OverDurationVideo_Rejected_AndAssetDeleted_NoMessage()
+    {
+        var (sut, convs, _, media, _) = BuildAll();
+        media.VideoDurationMs = ChatService.MaxVideoDurationMs + 1;   // 120.001 s
+        var conv = Conv(Me, Other, ConversationStatus.Accepted);
+        convs.Conversations.Add(conv);
+
+        var ex = await Assert.ThrowsAsync<ValidationException>(() =>
+            sut.SendMediaMessageAsync(conv.Id, MediaReq(), Input("video/mp4", Mp4)));
+
+        Assert.Equal(400, ex.StatusCode);
+        Assert.Contains("120 seconds", ex.Message);
+        Assert.Equal("skillora/chat/vid", Assert.Single(media.Deleted));   // uploaded, then cleaned up
+        Assert.Empty(convs.Messages);                                       // no message persisted
+    }
+
+    [Fact]
+    public async Task SendMedia_SpoofedExtension_RejectedOnMagicBytes_NoUpload()
+    {
+        var (sut, convs, _, media, _) = BuildAll();
+        var conv = Conv(Me, Other, ConversationStatus.Accepted);
+        convs.Conversations.Add(conv);
+        var notJpeg = new byte[] { 0x00, 0x01, 0x02, 0x03, 0, 0, 0, 0, 0, 0, 0, 0 };   // declared jpeg, isn't
+
+        var ex = await Assert.ThrowsAsync<ValidationException>(() =>
+            sut.SendMediaMessageAsync(conv.Id, MediaReq(), Input("image/jpeg", notJpeg)));
+
+        Assert.Equal(400, ex.StatusCode);
+        Assert.Equal(0, media.ImageUploads);
+        Assert.Empty(convs.Messages);
+    }
+
+    [Fact]
+    public async Task SendMedia_UnsupportedType_Rejected()
+    {
+        var (sut, convs, _, _, _) = BuildAll();
+        var conv = Conv(Me, Other, ConversationStatus.Accepted);
+        convs.Conversations.Add(conv);
+
+        var ex = await Assert.ThrowsAsync<ValidationException>(() =>
+            sut.SendMediaMessageAsync(conv.Id, MediaReq(), Input("application/pdf", Jpeg)));
+
+        Assert.Equal(400, ex.StatusCode);
+    }
+
+    [Fact]
+    public void Validator_TextBodyRequired()
+    {
+        var text = new FreelanceApp.Application.Features.Messaging.Validators.SendMessageRequestValidator()
+            .Validate(new SendMessageRequestDto { Body = "" });
+        Assert.False(text.IsValid);   // empty text body is invalid
+    }
+
+    [Fact]
+    public async Task SendMedia_NullCaption_Accepted()
+    {
+        // A media message may have no caption at all — this must succeed (the caption-optional rule,
+        // enforced by ChatService now, not a validator that never ran on the multipart endpoint).
+        var (sut, convs, _, _, _) = BuildAll();
+        var conv = Conv(Me, Other, ConversationStatus.Accepted);
+        convs.Conversations.Add(conv);
+
+        var msg = await sut.SendMediaMessageAsync(conv.Id, MediaReq(caption: null), Input("image/jpeg", Jpeg));
+
+        Assert.Equal(string.Empty, msg.Body);
+    }
+
+    [Fact]
+    public async Task SendMedia_CaptionTooLong_Rejected400_Not500()
+    {
+        // A 5000-char caption must be a clean 400 from ChatService — NOT a 500 when Body (varchar 4000)
+        // overflows at SaveChanges. The old SendMediaMessageRequestValidator was dead code: the multipart
+        // endpoint binds SendMediaMessageApiRequest, so auto-validation never ran the DTO validator.
+        var (sut, convs, _, media, _) = BuildAll();
+        var conv = Conv(Me, Other, ConversationStatus.Accepted);
+        convs.Conversations.Add(conv);
+
+        var ex = await Assert.ThrowsAsync<ValidationException>(() =>
+            sut.SendMediaMessageAsync(conv.Id, MediaReq(caption: new string('x', 5000)), Input("image/jpeg", Jpeg)));
+
+        Assert.Equal(400, ex.StatusCode);
+        Assert.Equal(0, media.ImageUploads);   // rejected before any upload
+        Assert.Empty(convs.Messages);
+    }
+
+    [Fact]
+    public async Task SendMedia_PendingInitiatorAtLimit_BlockedByRuleC_BeforeUpload()
+    {
+        var (sut, convs, _, media, _) = BuildAll();
+        var conv = Conv(Me, Other, ConversationStatus.Pending);   // Me initiated
+        convs.Conversations.Add(conv);
+        convs.Messages.Add(new Message { Id = Guid.NewGuid(), ConversationId = conv.Id, SenderId = Me, Body = "first", CreatedAt = DateTime.UtcNow });
+
+        var ex = await Assert.ThrowsAsync<ForbiddenException>(() =>
+            sut.SendMediaMessageAsync(conv.Id, MediaReq(), Input("image/jpeg", Jpeg)));
+
+        Assert.Equal(403, ex.StatusCode);
+        Assert.Equal(0, media.ImageUploads);   // gate ran BEFORE upload — media send inherits rule (c), no orphan
+    }
+
+    [Fact]
+    public async Task ForwardMedia_ReusesSamePublicId_WithoutReupload()
+    {
+        var (sut, convs, _, media, _) = BuildAll();
+        var source = Conv(Me, Other, ConversationStatus.Accepted);
+        var target = Conv(Me, Third, ConversationStatus.Accepted);
+        convs.Conversations.Add(source);
+        convs.Conversations.Add(target);
+        var img = new Message
+        {
+            Id = Guid.NewGuid(), ConversationId = source.Id, SenderId = Me, Body = "cap",
+            Type = MessageType.Image, CreatedAt = DateTime.UtcNow,
+            MediaUrl = "https://x/img.jpg", MediaThumbnailUrl = "https://x/thumb.jpg",
+            MediaWidth = 800, MediaHeight = 600, MediaMimeType = "image/jpeg",
+            MediaSizeBytes = 1234, MediaPublicId = "skillora/chat/img"
+        };
+        convs.Messages.Add(img);
+
+        var result = await sut.ForwardAsync(source.Id,
+            new ForwardMessagesRequestDto { TargetConversationId = target.Id, MessageIds = new List<Guid> { img.Id } });
+
+        var fwd = Assert.Single(result);
+        Assert.Equal(MessageType.Image, fwd.Type);
+        Assert.Equal("https://x/img.jpg", fwd.MediaUrl);
+        Assert.True(fwd.IsForwarded);
+        Assert.Equal(0, media.ImageUploads);   // a forward is a reference, not a copy — no re-upload
+        var persisted = convs.Messages.First(m => m.ConversationId == target.Id && m.Type == MessageType.Image);
+        Assert.Equal("skillora/chat/img", persisted.MediaPublicId);   // SAME asset id
+    }
+
+    [Fact]
+    public async Task EditMedia_Refused_400()
+    {
+        var (sut, convs, _, _, _) = BuildAll();
+        var conv = Conv(Me, Other, ConversationStatus.Accepted);
+        convs.Conversations.Add(conv);
+        var img = new Message { Id = Guid.NewGuid(), ConversationId = conv.Id, SenderId = Me, Body = "cap", Type = MessageType.Image, CreatedAt = DateTime.UtcNow };
+        convs.Messages.Add(img);
+
+        var ex = await Assert.ThrowsAsync<ValidationException>(() => sut.EditMessageAsync(conv.Id, img.Id, "new caption"));
+        Assert.Equal(400, ex.StatusCode);
+    }
+
+    [Fact]
+    public async Task DeleteForEveryone_BlanksMediaUrlAndThumbnail_InProjection()
+    {
+        var (sut, convs, _, _, _) = BuildAll();
+        var conv = Conv(Me, Other, ConversationStatus.Accepted);
+        convs.Conversations.Add(conv);
+        var img = new Message
+        {
+            Id = Guid.NewGuid(), ConversationId = conv.Id, SenderId = Me, Body = "cap",
+            Type = MessageType.Image, CreatedAt = DateTime.UtcNow,
+            MediaUrl = "https://x/img.jpg", MediaThumbnailUrl = "https://x/thumb.jpg", MediaPublicId = "pid"
+        };
+        convs.Messages.Add(img);
+
+        await sut.DeleteForEveryoneAsync(conv.Id, img.Id);
+        var page = await sut.GetMessagesAsync(conv.Id, null, 30);
+
+        var dto = Assert.Single(page.Items);
+        Assert.True(dto.IsDeleted);
+        Assert.Null(dto.MediaUrl);            // publicly-reachable URL must not leak for a tombstone
+        Assert.Null(dto.MediaThumbnailUrl);
+        Assert.Equal(string.Empty, dto.Body);
+    }
+
+    [Fact]
+    public async Task List_LastMessageType_ReflectsUncaptionedPhoto()
+    {
+        var (sut, convs, _, _, _) = BuildAll();
+        var conv = Conv(Me, Other, ConversationStatus.Accepted);
+        conv.LastMessageAt = DateTime.UtcNow;
+        convs.Conversations.Add(conv);
+        convs.Messages.Add(new Message { Id = Guid.NewGuid(), ConversationId = conv.Id, SenderId = Other, Body = "", Type = MessageType.Image, CreatedAt = DateTime.UtcNow });
+
+        var list = await sut.GetConversationsAsync(1, 20);
+
+        var row = Assert.Single(list.Items);
+        Assert.Equal(MessageType.Image, row.LastMessageType);
+        Assert.Equal("", row.LastMessagePreview);   // empty preview → client localises "Photo" from the type
+    }
+
+    // ===== VOICE (M-M6) =====
+
+    private static readonly byte[] M4a = { 0, 0, 0, 0x18, 0x66, 0x74, 0x79, 0x70, 0x4D, 0x34, 0x41, 0x20 }; // ftyp M4A
+    private static readonly byte[] Aac = { 0xFF, 0xF1, 0x50, 0x80, 0, 0, 0, 0, 0, 0, 0, 0 };                 // ADTS sync
+    private static readonly byte[] Ogg = { 0x4F, 0x67, 0x67, 0x53, 0, 0, 0, 0, 0, 0, 0, 0 };                 // "OggS"
+    // audio/webm shares the EBML signature with video/webm — reuse the Webm bytes.
+
+    private static byte[] AudioBytes(string contentType) => contentType switch
+    {
+        "audio/mp4"  => M4a,
+        "audio/aac"  => Aac,
+        "audio/ogg"  => Ogg,
+        _            => Webm
+    };
+
+    [Theory]
+    [InlineData("audio/mp4")]
+    [InlineData("audio/aac")]
+    [InlineData("audio/ogg")]
+    [InlineData("audio/webm")]
+    public async Task SendVoice_AcceptedAudioType_CreatesVoiceMessage_NoThumbnailNoDimensions(string contentType)
+    {
+        var (sut, convs, _, media, _) = BuildAll();
+        var conv = Conv(Me, Other, ConversationStatus.Accepted);
+        convs.Conversations.Add(conv);
+
+        var msg = await sut.SendMediaMessageAsync(conv.Id, MediaReq(), Input(contentType, AudioBytes(contentType)));
+
+        Assert.Equal(MessageType.Voice, msg.Type);
+        Assert.Equal(string.Empty, msg.Body);              // a voice note has no caption
+        Assert.Equal("https://res.cloudinary.com/x/video/upload/v1/skillora/chat/voice.m4a", msg.MediaUrl);
+        Assert.Null(msg.MediaThumbnailUrl);                // no poster for audio
+        Assert.Null(msg.MediaWidth);
+        Assert.Null(msg.MediaHeight);
+        Assert.Equal(8000, msg.MediaDurationMs);
+        Assert.Equal(1, media.AudioUploads);
+        Assert.Equal(0, media.ImageUploads + media.VideoUploads);   // routed to the audio path only
+        Assert.Single(convs.Messages);
+    }
+
+    [Fact]
+    public async Task SendVoice_OversizeAudio_Rejected_NamingLimit_NoUpload()
+    {
+        var (sut, convs, _, media, _) = BuildAll();
+        var conv = Conv(Me, Other, ConversationStatus.Accepted);
+        convs.Conversations.Add(conv);
+
+        var ex = await Assert.ThrowsAsync<ValidationException>(() =>
+            sut.SendMediaMessageAsync(conv.Id, MediaReq(), Input("audio/mp4", M4a, length: ChatService.MaxAudioBytes + 1)));
+
+        Assert.Equal(400, ex.StatusCode);
+        Assert.Contains("10 MB", ex.Message);
+        Assert.Equal(0, media.AudioUploads);
+        Assert.Empty(convs.Messages);
+    }
+
+    [Fact]
+    public async Task SendVoice_OverDurationAudio_Rejected_AndAssetDeleted_NoMessage()
+    {
+        var (sut, convs, _, media, _) = BuildAll();
+        media.AudioDurationMs = ChatService.MaxAudioDurationMs + 1;   // 300.001 s
+        var conv = Conv(Me, Other, ConversationStatus.Accepted);
+        convs.Conversations.Add(conv);
+
+        var ex = await Assert.ThrowsAsync<ValidationException>(() =>
+            sut.SendMediaMessageAsync(conv.Id, MediaReq(), Input("audio/mp4", M4a)));
+
+        Assert.Equal(400, ex.StatusCode);
+        Assert.Contains("300 seconds", ex.Message);
+        Assert.Equal("skillora/chat/voice", Assert.Single(media.Deleted));   // uploaded, then cleaned up
+        Assert.Empty(convs.Messages);
+    }
+
+    [Fact]
+    public async Task SendVoice_VideoBytesDeclaredAsAudio_RejectedOnMagicBytes()
+    {
+        var (sut, convs, _, media, _) = BuildAll();
+        var conv = Conv(Me, Other, ConversationStatus.Accepted);
+        convs.Conversations.Add(conv);
+        // An mp4 VIDEO payload declared as audio/ogg — the OggS signature won't match, so it is refused.
+        var ex = await Assert.ThrowsAsync<ValidationException>(() =>
+            sut.SendMediaMessageAsync(conv.Id, MediaReq(), Input("audio/ogg", Mp4)));
+
+        Assert.Equal(400, ex.StatusCode);
+        Assert.Equal(0, media.AudioUploads);
+    }
+
+    [Fact]
+    public async Task SendMedia_AudioBytesDeclaredAsVideo_RejectedOnMagicBytes()
+    {
+        var (sut, convs, _, media, _) = BuildAll();
+        var conv = Conv(Me, Other, ConversationStatus.Accepted);
+        convs.Conversations.Add(conv);
+        // An OGG AUDIO payload declared as video/mp4 — the ftyp signature won't match, so it is refused.
+        var ex = await Assert.ThrowsAsync<ValidationException>(() =>
+            sut.SendMediaMessageAsync(conv.Id, MediaReq(), Input("video/mp4", Ogg)));
+
+        Assert.Equal(400, ex.StatusCode);
+        Assert.Equal(0, media.VideoUploads);
+    }
+
+    [Fact]
+    public async Task SendVoice_WithWaveform_StoredAndProjected()
+    {
+        var (sut, convs, _, _, _) = BuildAll();
+        var conv = Conv(Me, Other, ConversationStatus.Accepted);
+        convs.Conversations.Add(conv);
+
+        var msg = await sut.SendMediaMessageAsync(conv.Id,
+            new SendMediaMessageRequestDto { Waveform = "80,60,90,40" }, Input("audio/mp4", M4a));
+
+        Assert.Equal("80,60,90,40", msg.MediaWaveform);
+        var page = await sut.GetMessagesAsync(conv.Id, null, 30);
+        Assert.Equal("80,60,90,40", Assert.Single(page.Items).MediaWaveform);   // projected on the page too
+    }
+
+    [Fact]
+    public async Task SendVoice_NullWaveform_Accepted_StoresNull()
+    {
+        var (sut, convs, _, _, _) = BuildAll();
+        var conv = Conv(Me, Other, ConversationStatus.Accepted);
+        convs.Conversations.Add(conv);
+
+        var msg = await sut.SendMediaMessageAsync(conv.Id,
+            new SendMediaMessageRequestDto { Waveform = null }, Input("audio/mp4", M4a));
+
+        Assert.Equal(MessageType.Voice, msg.Type);
+        Assert.Null(msg.MediaWaveform);   // client will render a flat bar
+    }
+
+    [Theory]
+    [InlineData("0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63,64")] // 65 samples
+    [InlineData("80,101,60")]   // out of range (>100)
+    [InlineData("80,-1,60")]    // out of range (<0)
+    [InlineData("80,abc,60")]   // non-numeric
+    public async Task SendVoice_MalformedWaveform_Rejected400(string waveform)
+    {
+        var (sut, convs, _, media, _) = BuildAll();
+        var conv = Conv(Me, Other, ConversationStatus.Accepted);
+        convs.Conversations.Add(conv);
+
+        var ex = await Assert.ThrowsAsync<ValidationException>(() =>
+            sut.SendMediaMessageAsync(conv.Id, new SendMediaMessageRequestDto { Waveform = waveform }, Input("audio/mp4", M4a)));
+
+        Assert.Equal(400, ex.StatusCode);
+        Assert.Empty(convs.Messages);   // rejected — nothing persisted
+    }
+
+    [Fact]
+    public async Task SendVoice_PendingInitiatorAtLimit_BlockedByRuleC_BeforeUpload()
+    {
+        var (sut, convs, _, media, _) = BuildAll();
+        var conv = Conv(Me, Other, ConversationStatus.Pending);   // Me initiated
+        convs.Conversations.Add(conv);
+        convs.Messages.Add(new Message { Id = Guid.NewGuid(), ConversationId = conv.Id, SenderId = Me, Body = "first", CreatedAt = DateTime.UtcNow });
+
+        var ex = await Assert.ThrowsAsync<ForbiddenException>(() =>
+            sut.SendMediaMessageAsync(conv.Id, MediaReq(), Input("audio/mp4", M4a)));
+
+        Assert.Equal(403, ex.StatusCode);
+        Assert.Equal(0, media.AudioUploads);   // rule (c) ran BEFORE upload — no orphan asset
+    }
+
+    [Fact]
+    public async Task ForwardVoice_ReusesSamePublicId_AndWaveform_WithoutReupload()
+    {
+        var (sut, convs, _, media, _) = BuildAll();
+        var source = Conv(Me, Other, ConversationStatus.Accepted);
+        var target = Conv(Me, Third, ConversationStatus.Accepted);
+        convs.Conversations.Add(source);
+        convs.Conversations.Add(target);
+        var voice = new Message
+        {
+            Id = Guid.NewGuid(), ConversationId = source.Id, SenderId = Me, Body = string.Empty,
+            Type = MessageType.Voice, CreatedAt = DateTime.UtcNow,
+            MediaUrl = "https://x/voice.m4a", MediaMimeType = "audio/mp4", MediaDurationMs = 8000,
+            MediaSizeBytes = 34567, MediaPublicId = "skillora/chat/voice", MediaWaveform = "10,20,30"
+        };
+        convs.Messages.Add(voice);
+
+        var result = await sut.ForwardAsync(source.Id,
+            new ForwardMessagesRequestDto { TargetConversationId = target.Id, MessageIds = new List<Guid> { voice.Id } });
+
+        var fwd = Assert.Single(result);
+        Assert.Equal(MessageType.Voice, fwd.Type);
+        Assert.Equal("https://x/voice.m4a", fwd.MediaUrl);
+        Assert.Equal("10,20,30", fwd.MediaWaveform);
+        Assert.True(fwd.IsForwarded);
+        Assert.Equal(0, media.AudioUploads);   // a forward is a reference, not a copy
+        var persisted = convs.Messages.First(m => m.ConversationId == target.Id && m.Type == MessageType.Voice);
+        Assert.Equal("skillora/chat/voice", persisted.MediaPublicId);   // SAME asset id
+    }
+
+    [Fact]
+    public async Task EditVoice_Refused_400()
+    {
+        var (sut, convs, _, _, _) = BuildAll();
+        var conv = Conv(Me, Other, ConversationStatus.Accepted);
+        convs.Conversations.Add(conv);
+        var voice = new Message { Id = Guid.NewGuid(), ConversationId = conv.Id, SenderId = Me, Body = string.Empty, Type = MessageType.Voice, CreatedAt = DateTime.UtcNow };
+        convs.Messages.Add(voice);
+
+        var ex = await Assert.ThrowsAsync<ValidationException>(() => sut.EditMessageAsync(conv.Id, voice.Id, "caption"));
+        Assert.Equal(400, ex.StatusCode);   // the M5 media edit-guard covers Voice, not just Image/Video
+    }
+
+    [Fact]
+    public async Task DeleteForEveryoneVoice_BlanksMediaUrlAndWaveform_InProjection()
+    {
+        var (sut, convs, _, _, _) = BuildAll();
+        var conv = Conv(Me, Other, ConversationStatus.Accepted);
+        convs.Conversations.Add(conv);
+        var voice = new Message
+        {
+            Id = Guid.NewGuid(), ConversationId = conv.Id, SenderId = Me, Body = string.Empty,
+            Type = MessageType.Voice, CreatedAt = DateTime.UtcNow,
+            MediaUrl = "https://x/voice.m4a", MediaPublicId = "pid", MediaWaveform = "10,20,30"
+        };
+        convs.Messages.Add(voice);
+
+        await sut.DeleteForEveryoneAsync(conv.Id, voice.Id);
+        var page = await sut.GetMessagesAsync(conv.Id, null, 30);
+
+        var dto = Assert.Single(page.Items);
+        Assert.True(dto.IsDeleted);
+        Assert.Null(dto.MediaUrl);
+        Assert.Null(dto.MediaWaveform);   // a waveform left on a deleted voice note would be a small leak
+    }
+
+    [Fact]
+    public async Task List_LastMessageType_ReflectsVoiceNote()
+    {
+        var (sut, convs, _, _, _) = BuildAll();
+        var conv = Conv(Me, Other, ConversationStatus.Accepted);
+        conv.LastMessageAt = DateTime.UtcNow;
+        convs.Conversations.Add(conv);
+        convs.Messages.Add(new Message { Id = Guid.NewGuid(), ConversationId = conv.Id, SenderId = Other, Body = "", Type = MessageType.Voice, CreatedAt = DateTime.UtcNow });
+
+        var list = await sut.GetConversationsAsync(1, 20);
+
+        var row = Assert.Single(list.Items);
+        Assert.Equal(MessageType.Voice, row.LastMessageType);   // client renders its own localised label
+    }
+
+    [Fact]
+    public async Task ReplyToVoice_ReplyToCarriesVoiceType_EmptySnippet()
+    {
+        var (sut, convs, _, _, _) = BuildAll();
+        var conv = Conv(Me, Other, ConversationStatus.Accepted);
+        convs.Conversations.Add(conv);
+        var voice = new Message { Id = Guid.NewGuid(), ConversationId = conv.Id, SenderId = Other, Body = string.Empty, Type = MessageType.Voice, CreatedAt = DateTime.UtcNow };
+        convs.Messages.Add(voice);
+
+        var dto = await sut.SendMessageAsync(conv.Id, new SendMessageRequestDto { Body = "replying to your voice", ReplyToMessageId = voice.Id });
+
+        Assert.NotNull(dto.ReplyTo);
+        Assert.Equal(MessageType.Voice, dto.ReplyTo!.Type);      // client renders its own "Voice message" label
+        Assert.Equal(string.Empty, dto.ReplyTo.BodySnippet);     // no caption to quote
+    }
+
+    // ===== DOCUMENTS (M-M8) =====
+
+    private static readonly byte[] Pdf  = { 0x25, 0x50, 0x44, 0x46, 0x2D, 0x31, 0x2E, 0x37, 0, 0, 0, 0 }; // %PDF-1.7
+    private static readonly byte[] Zip  = { 0x50, 0x4B, 0x03, 0x04, 0, 0, 0, 0, 0, 0, 0, 0 };             // PK\x03\x04 (OOXML)
+    private static readonly byte[] Ole2 = { 0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1, 0, 0, 0, 0 }; // OLE2 compound
+    private static readonly byte[] TextDoc = System.Text.Encoding.ASCII.GetBytes("name,role\nUbaid,dev\n");
+    private static readonly byte[] Exe  = { 0x4D, 0x5A, 0x90, 0x00, 0, 0, 0, 0, 0, 0, 0, 0 };             // MZ (Windows PE)
+
+    private const string DocxMime = "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+    private const string XlsxMime = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+    private const string PptxMime = "application/vnd.openxmlformats-officedocument.presentationml.presentation";
+
+    private static MediaUploadInput DocInput(string fileName, string contentType, byte[] bytes, long? length = null) =>
+        new() { Content = new MemoryStream(bytes), FileName = fileName, ContentType = contentType, Length = length ?? bytes.Length };
+
+    public static IEnumerable<object[]> AllowedDocs() => new[]
+    {
+        new object[] { "contract.pdf", "application/pdf", Pdf },
+        new object[] { "report.docx",  DocxMime,          Zip },
+        new object[] { "sheet.xlsx",   XlsxMime,          Zip },
+        new object[] { "deck.pptx",    PptxMime,          Zip },
+        new object[] { "old.doc",      "application/msword",           Ole2 },
+        new object[] { "old.xls",      "application/vnd.ms-excel",     Ole2 },
+        new object[] { "old.ppt",      "application/vnd.ms-powerpoint",Ole2 },
+        new object[] { "notes.txt",    "text/plain",      TextDoc },
+        new object[] { "data.csv",     "text/csv",        TextDoc },
+    };
+
+    [Theory]
+    [MemberData(nameof(AllowedDocs))]
+    public async Task SendDocument_AllowedType_CreatesFileMessage_FilenameStored(string fileName, string mime, byte[] bytes)
+    {
+        var (sut, convs, _, media, _) = BuildAll();
+        var conv = Conv(Me, Other, ConversationStatus.Accepted);
+        convs.Conversations.Add(conv);
+
+        var msg = await sut.SendMediaMessageAsync(conv.Id, MediaReq(caption: "see attached"), DocInput(fileName, mime, bytes));
+
+        Assert.Equal(MessageType.File, msg.Type);          // the reserved File = 2
+        Assert.Equal("see attached", msg.Body);            // caption stored as Body
+        Assert.Equal(fileName, msg.MediaFileName);         // clean name stored verbatim
+        Assert.Equal("https://res.cloudinary.com/x/raw/upload/v1/skillora/chat/doc.pdf", msg.MediaUrl);
+        Assert.Null(msg.MediaThumbnailUrl);                // no poster for a document
+        Assert.Null(msg.MediaWidth);
+        Assert.Null(msg.MediaHeight);
+        Assert.Null(msg.MediaDurationMs);
+        Assert.Equal(1, media.DocumentUploads);
+        Assert.Equal(0, media.ImageUploads + media.VideoUploads + media.AudioUploads);   // document path only
+        Assert.Single(convs.Messages);
+    }
+
+    [Fact]
+    public async Task SendDocument_ExecutableExtension_RejectedOnExtension_NoUpload()
+    {
+        var (sut, convs, _, media, _) = BuildAll();
+        var conv = Conv(Me, Other, ConversationStatus.Accepted);
+        convs.Conversations.Add(conv);
+
+        var ex = await Assert.ThrowsAsync<ValidationException>(() =>
+            sut.SendMediaMessageAsync(conv.Id, MediaReq(), DocInput("malware.exe", "application/octet-stream", Exe)));
+
+        Assert.Equal(400, ex.StatusCode);
+        Assert.Contains("Unsupported file type", ex.Message);
+        Assert.Equal(0, media.DocumentUploads);            // rejected at the extension layer, no upload
+        Assert.Empty(convs.Messages);
+    }
+
+    [Fact]
+    public async Task SendDocument_ExecutableRenamedToPdf_RejectedOnMagicBytes_NoUpload()
+    {
+        var (sut, convs, _, media, _) = BuildAll();
+        var conv = Conv(Me, Other, ConversationStatus.Accepted);
+        convs.Conversations.Add(conv);
+        // An MZ payload declared as a PDF: passes extension + MIME, fails the %PDF- family check.
+        var ex = await Assert.ThrowsAsync<ValidationException>(() =>
+            sut.SendMediaMessageAsync(conv.Id, MediaReq(), DocInput("invoice.pdf", "application/pdf", Exe)));
+
+        Assert.Equal(400, ex.StatusCode);
+        Assert.Contains("content does not match", ex.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(0, media.DocumentUploads);
+        Assert.Empty(convs.Messages);
+    }
+
+    [Fact]
+    public async Task SendDocument_Zip_Rejected_NotOnAllowlist()
+    {
+        var (sut, convs, _, media, _) = BuildAll();
+        var conv = Conv(Me, Other, ConversationStatus.Accepted);
+        convs.Conversations.Add(conv);
+
+        var ex = await Assert.ThrowsAsync<ValidationException>(() =>
+            sut.SendMediaMessageAsync(conv.Id, MediaReq(), DocInput("archive.zip", "application/zip", Zip)));
+
+        Assert.Equal(400, ex.StatusCode);
+        Assert.Equal(0, media.DocumentUploads);            // .zip is deliberately excluded from the allowlist
+    }
+
+    [Fact]
+    public async Task SendDocument_Oversize_Rejected_NamingLimit_NoUpload()
+    {
+        var (sut, convs, _, media, _) = BuildAll();
+        var conv = Conv(Me, Other, ConversationStatus.Accepted);
+        convs.Conversations.Add(conv);
+
+        var ex = await Assert.ThrowsAsync<ValidationException>(() =>
+            sut.SendMediaMessageAsync(conv.Id, MediaReq(), DocInput("big.pdf", "application/pdf", Pdf, length: ChatService.MaxDocumentBytes + 1)));
+
+        Assert.Equal(400, ex.StatusCode);
+        Assert.Contains("25 MB", ex.Message);
+        Assert.Equal(0, media.DocumentUploads);            // size checked before reading the whole file
+    }
+
+    [Fact]
+    public async Task SendDocument_ExtensionMimeMismatch_Rejected()
+    {
+        var (sut, convs, _, media, _) = BuildAll();
+        var conv = Conv(Me, Other, ConversationStatus.Accepted);
+        convs.Conversations.Add(conv);
+        // A .pdf declared text/plain — inconsistent regardless of the bytes.
+        var ex = await Assert.ThrowsAsync<ValidationException>(() =>
+            sut.SendMediaMessageAsync(conv.Id, MediaReq(), DocInput("contract.pdf", "text/plain", Pdf)));
+
+        Assert.Equal(400, ex.StatusCode);
+        Assert.Contains("inconsistent", ex.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(0, media.DocumentUploads);
+    }
+
+    [Fact]
+    public async Task SendDocument_DocxWithOle2Bytes_RejectedOnFamilyMismatch()
+    {
+        var (sut, convs, _, media, _) = BuildAll();
+        var conv = Conv(Me, Other, ConversationStatus.Accepted);
+        convs.Conversations.Add(conv);
+        // A .docx (declared correctly) whose bytes are OLE2, not zip — family mismatch.
+        var ex = await Assert.ThrowsAsync<ValidationException>(() =>
+            sut.SendMediaMessageAsync(conv.Id, MediaReq(), DocInput("report.docx", DocxMime, Ole2)));
+
+        Assert.Equal(400, ex.StatusCode);
+        Assert.Contains("content does not match", ex.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(0, media.DocumentUploads);
+    }
+
+    [Fact]
+    public async Task SendDocument_TxtWithNullBytes_Rejected()
+    {
+        var (sut, convs, _, media, _) = BuildAll();
+        var conv = Conv(Me, Other, ConversationStatus.Accepted);
+        convs.Conversations.Add(conv);
+        var nullish = new byte[] { 0x68, 0x69, 0x00, 0x68, 0x69 };   // "hi\0hi" — a null byte marks binary
+        var ex = await Assert.ThrowsAsync<ValidationException>(() =>
+            sut.SendMediaMessageAsync(conv.Id, MediaReq(), DocInput("notes.txt", "text/plain", nullish)));
+
+        Assert.Equal(400, ex.StatusCode);
+        Assert.Equal(0, media.DocumentUploads);
+    }
+
+    [Fact]
+    public async Task SendDocument_ValidTxt_Accepted()
+    {
+        var (sut, convs, _, media, _) = BuildAll();
+        var conv = Conv(Me, Other, ConversationStatus.Accepted);
+        convs.Conversations.Add(conv);
+
+        var msg = await sut.SendMediaMessageAsync(conv.Id, MediaReq(), DocInput("notes.txt", "text/plain", TextDoc));
+
+        Assert.Equal(MessageType.File, msg.Type);
+        Assert.Equal("notes.txt", msg.MediaFileName);
+        Assert.Equal(1, media.DocumentUploads);
+    }
+
+    [Theory]
+    [InlineData("../../../etc/passwd.pdf", "passwd.pdf")]      // path traversal — keep only the base name
+    [InlineData("..\\..\\secret.pdf", "secret.pdf")]           // windows-style path stripped
+    public async Task SendDocument_FileName_PathStripped(string given, string expected)
+    {
+        var (sut, convs, _, _, _) = BuildAll();
+        var conv = Conv(Me, Other, ConversationStatus.Accepted);
+        convs.Conversations.Add(conv);
+
+        var msg = await sut.SendMediaMessageAsync(conv.Id, MediaReq(), DocInput(given, "application/pdf", Pdf));
+
+        Assert.Equal(expected, msg.MediaFileName);
+    }
+
+    // Crafted attack names are built at RUNTIME with (char) casts so the source file stays plain ASCII
+    // (an embedded null or RTL-override byte in source is fragile). Each still exercises real stripping.
+    [Fact]
+    public async Task SendDocument_FileName_NullAndControlCharsStripped()
+    {
+        var (sut, convs, _, _, _) = BuildAll();
+        var conv = Conv(Me, Other, ConversationStatus.Accepted);
+        convs.Conversations.Add(conv);
+        var given = "re" + (char)0x00 + "po" + (char)0x1F + "rt.pdf";   // null + a C0 control char
+
+        var msg = await sut.SendMediaMessageAsync(conv.Id, MediaReq(), DocInput(given, "application/pdf", Pdf));
+
+        Assert.Equal("report.pdf", msg.MediaFileName);
+    }
+
+    [Fact]
+    public async Task SendDocument_FileName_RtlOverrideStripped()
+    {
+        var (sut, convs, _, _, _) = BuildAll();
+        var conv = Conv(Me, Other, ConversationStatus.Accepted);
+        convs.Conversations.Add(conv);
+        // report<U+202E>fdp.pdf renders to the eye as reportexe.pdf — the override must be stripped.
+        var given = "report" + (char)0x202E + "fdp.pdf";
+
+        var msg = await sut.SendMediaMessageAsync(conv.Id, MediaReq(), DocInput(given, "application/pdf", Pdf));
+
+        Assert.Equal("reportfdp.pdf", msg.MediaFileName);
+    }
+
+    [Fact]
+    public async Task SendDocument_OverLengthFileName_TruncatedPreservingExtension()
+    {
+        var (sut, convs, _, _, _) = BuildAll();
+        var conv = Conv(Me, Other, ConversationStatus.Accepted);
+        convs.Conversations.Add(conv);
+
+        var msg = await sut.SendMediaMessageAsync(conv.Id, MediaReq(), DocInput(new string('a', 300) + ".pdf", "application/pdf", Pdf));
+
+        Assert.Equal(255, msg.MediaFileName!.Length);        // truncated to the 255 cap
+        Assert.EndsWith(".pdf", msg.MediaFileName);          // extension preserved
+    }
+
+    [Fact]
+    public async Task SendDocument_EmptyAfterSanitising_UsesGeneratedName()
+    {
+        var (sut, convs, _, _, _) = BuildAll();
+        var conv = Conv(Me, Other, ConversationStatus.Accepted);
+        convs.Conversations.Add(conv);
+        // Only bidi controls + extension → stem empty after stripping → generated "document".
+        var given = ((char)0x202E).ToString() + (char)0x202D + ".pdf";
+
+        var msg = await sut.SendMediaMessageAsync(conv.Id, MediaReq(), DocInput(given, "application/pdf", Pdf));
+
+        Assert.Equal("document.pdf", msg.MediaFileName);
+    }
+
+    [Fact]
+    public async Task SendDocument_PendingInitiatorAtLimit_BlockedByRuleC_BeforeUpload()
+    {
+        var (sut, convs, _, media, _) = BuildAll();
+        var conv = Conv(Me, Other, ConversationStatus.Pending);   // Me initiated
+        convs.Conversations.Add(conv);
+        convs.Messages.Add(new Message { Id = Guid.NewGuid(), ConversationId = conv.Id, SenderId = Me, Body = "first", CreatedAt = DateTime.UtcNow });
+
+        var ex = await Assert.ThrowsAsync<ForbiddenException>(() =>
+            sut.SendMediaMessageAsync(conv.Id, MediaReq(), DocInput("x.pdf", "application/pdf", Pdf)));
+
+        Assert.Equal(403, ex.StatusCode);
+        Assert.Equal(0, media.DocumentUploads);              // rule (c) ran before upload — no orphan asset
+    }
+
+    [Fact]
+    public async Task ForwardDocument_ReusesSamePublicIdAndFileName_WithoutReupload()
+    {
+        var (sut, convs, _, media, _) = BuildAll();
+        var source = Conv(Me, Other, ConversationStatus.Accepted);
+        var target = Conv(Me, Third, ConversationStatus.Accepted);
+        convs.Conversations.Add(source);
+        convs.Conversations.Add(target);
+        var doc = new Message
+        {
+            Id = Guid.NewGuid(), ConversationId = source.Id, SenderId = Me, Body = "cap",
+            Type = MessageType.File, CreatedAt = DateTime.UtcNow,
+            MediaUrl = "https://x/doc.pdf", MediaMimeType = "application/pdf",
+            MediaSizeBytes = 4096, MediaPublicId = "skillora/chat/doc", MediaFileName = "contract.pdf"
+        };
+        convs.Messages.Add(doc);
+
+        var result = await sut.ForwardAsync(source.Id,
+            new ForwardMessagesRequestDto { TargetConversationId = target.Id, MessageIds = new List<Guid> { doc.Id } });
+
+        var fwd = Assert.Single(result);
+        Assert.Equal(MessageType.File, fwd.Type);
+        Assert.Equal("https://x/doc.pdf", fwd.MediaUrl);
+        Assert.Equal("contract.pdf", fwd.MediaFileName);     // filename shared, no re-upload
+        Assert.True(fwd.IsForwarded);
+        Assert.Equal(0, media.DocumentUploads);
+        var persisted = convs.Messages.First(m => m.ConversationId == target.Id && m.Type == MessageType.File);
+        Assert.Equal("skillora/chat/doc", persisted.MediaPublicId);   // SAME asset id
+        Assert.Equal("contract.pdf", persisted.MediaFileName);
+    }
+
+    [Fact]
+    public async Task EditDocument_Refused_400()
+    {
+        var (sut, convs, _, _, _) = BuildAll();
+        var conv = Conv(Me, Other, ConversationStatus.Accepted);
+        convs.Conversations.Add(conv);
+        var doc = new Message { Id = Guid.NewGuid(), ConversationId = conv.Id, SenderId = Me, Body = "cap", Type = MessageType.File, CreatedAt = DateTime.UtcNow };
+        convs.Messages.Add(doc);
+
+        var ex = await Assert.ThrowsAsync<ValidationException>(() => sut.EditMessageAsync(conv.Id, doc.Id, "new caption"));
+        Assert.Equal(400, ex.StatusCode);                    // the media edit-guard now covers File too
+    }
+
+    [Fact]
+    public async Task DeleteForEveryoneDocument_BlanksUrlAndFileName_InProjection()
+    {
+        var (sut, convs, _, _, _) = BuildAll();
+        var conv = Conv(Me, Other, ConversationStatus.Accepted);
+        convs.Conversations.Add(conv);
+        var doc = new Message
+        {
+            Id = Guid.NewGuid(), ConversationId = conv.Id, SenderId = Me, Body = "cap",
+            Type = MessageType.File, CreatedAt = DateTime.UtcNow,
+            MediaUrl = "https://x/doc.pdf", MediaPublicId = "pid", MediaFileName = "salary_negotiation_final.pdf"
+        };
+        convs.Messages.Add(doc);
+
+        await sut.DeleteForEveryoneAsync(conv.Id, doc.Id);
+        var page = await sut.GetMessagesAsync(conv.Id, null, 30);
+
+        var dto = Assert.Single(page.Items);
+        Assert.True(dto.IsDeleted);
+        Assert.Null(dto.MediaUrl);
+        Assert.Null(dto.MediaFileName);                      // a filename leaks meaning even when the file is gone
+        Assert.Equal(string.Empty, dto.Body);
+    }
+
+    [Fact]
+    public async Task ReplyToDocument_ReplyToCarriesFileName()
+    {
+        var (sut, convs, _, _, _) = BuildAll();
+        var conv = Conv(Me, Other, ConversationStatus.Accepted);
+        convs.Conversations.Add(conv);
+        var doc = new Message
+        {
+            Id = Guid.NewGuid(), ConversationId = conv.Id, SenderId = Other, Body = string.Empty,
+            Type = MessageType.File, CreatedAt = DateTime.UtcNow, MediaFileName = "contract.pdf", MediaUrl = "https://x/doc.pdf"
+        };
+        convs.Messages.Add(doc);
+
+        var dto = await sut.SendMessageAsync(conv.Id, new SendMessageRequestDto { Body = "signed?", ReplyToMessageId = doc.Id });
+
+        Assert.NotNull(dto.ReplyTo);
+        Assert.Equal(MessageType.File, dto.ReplyTo!.Type);
+        Assert.Equal("contract.pdf", dto.ReplyTo.FileName);  // reply quotes the filename, not a generic label
+    }
+
+    [Fact]
+    public async Task List_LastMessageType_ReflectsDocument()
+    {
+        var (sut, convs, _, _, _) = BuildAll();
+        var conv = Conv(Me, Other, ConversationStatus.Accepted);
+        conv.LastMessageAt = DateTime.UtcNow;
+        convs.Conversations.Add(conv);
+        convs.Messages.Add(new Message { Id = Guid.NewGuid(), ConversationId = conv.Id, SenderId = Other, Body = "", Type = MessageType.File, CreatedAt = DateTime.UtcNow, MediaFileName = "contract.pdf" });
+
+        var list = await sut.GetConversationsAsync(1, 20);
+
+        var row = Assert.Single(list.Items);
+        Assert.Equal(MessageType.File, row.LastMessageType);   // client renders its own localised "Document" label
+    }
+
+    // ===== VOICE "PLAYED" RECEIPTS (M-M7) =====
+
+    // Seed a voice note sent by `sender` in `conv`, returning it.
+    private static Message SeedVoice(FakeConversationRepository convs, Conversation conv, Guid sender, bool deleted = false)
+    {
+        var v = new Message
+        {
+            Id = Guid.NewGuid(), ConversationId = conv.Id, SenderId = sender, Body = string.Empty,
+            Type = MessageType.Voice, CreatedAt = DateTime.UtcNow.AddMinutes(-1),
+            MediaUrl = "https://x/voice.m4a", MediaPublicId = "pid",
+            DeletedAt = deleted ? DateTime.UtcNow : null
+        };
+        convs.Messages.Add(v);
+        return v;
+    }
+
+    [Fact]
+    public async Task MarkPlayed_CreatesRecord_AndNotifiesSenderOnly()
+    {
+        var (sut, convs, _, notifier) = Build();   // caller = Me (the recipient/player)
+        var conv = Conv(Other, Me, ConversationStatus.Accepted);
+        convs.Conversations.Add(conv);
+        var voice = SeedVoice(convs, conv, sender: Other);
+
+        await sut.MarkPlayedAsync(conv.Id, voice.Id);
+
+        var play = Assert.Single(convs.Plays);
+        Assert.Equal(voice.Id, play.MessageId);
+        Assert.Equal(Me, play.UserId);
+        var evt = Assert.Single(notifier.Played);
+        Assert.Equal(Other, evt.userId);          // sender only — never the player
+        Assert.Equal(conv.Id, evt.conversationId);
+        Assert.Equal(voice.Id, evt.messageId);
+    }
+
+    [Fact]
+    public async Task MarkPlayed_SecondCall_Idempotent_NoSecondEvent()
+    {
+        var (sut, convs, _, notifier) = Build();
+        var conv = Conv(Other, Me, ConversationStatus.Accepted);
+        convs.Conversations.Add(conv);
+        var voice = SeedVoice(convs, conv, sender: Other);
+
+        await sut.MarkPlayedAsync(conv.Id, voice.Id);
+        await sut.MarkPlayedAsync(conv.Id, voice.Id);
+
+        Assert.Single(convs.Plays);        // still exactly one record
+        Assert.Single(notifier.Played);    // and exactly one event — the repeat pushed nothing
+    }
+
+    [Fact]
+    public async Task MarkPlayed_NotParticipant_Throws403()
+    {
+        var (sut, convs, _, _) = Build();   // caller = Me, not in conv
+        var conv = Conv(Other, Third, ConversationStatus.Accepted);
+        convs.Conversations.Add(conv);
+        var voice = SeedVoice(convs, conv, sender: Other);
+
+        var ex = await Assert.ThrowsAsync<ForbiddenException>(() => sut.MarkPlayedAsync(conv.Id, voice.Id));
+        Assert.Equal(403, ex.StatusCode);
+    }
+
+    [Fact]
+    public async Task MarkPlayed_UnknownMessage_Throws404()
+    {
+        var (sut, convs, _, _) = Build();
+        var conv = Conv(Other, Me, ConversationStatus.Accepted);
+        convs.Conversations.Add(conv);
+
+        var ex = await Assert.ThrowsAsync<NotFoundException>(() => sut.MarkPlayedAsync(conv.Id, Guid.NewGuid()));
+        Assert.Equal(404, ex.StatusCode);
+    }
+
+    [Fact]
+    public async Task MarkPlayed_TextMessage_Throws400()
+    {
+        var (sut, convs, _, _) = Build();
+        var conv = Conv(Other, Me, ConversationStatus.Accepted);
+        convs.Conversations.Add(conv);
+        var text = new Message { Id = Guid.NewGuid(), ConversationId = conv.Id, SenderId = Other, Body = "hi", Type = MessageType.Text, CreatedAt = DateTime.UtcNow };
+        convs.Messages.Add(text);
+
+        var ex = await Assert.ThrowsAsync<ValidationException>(() => sut.MarkPlayedAsync(conv.Id, text.Id));
+        Assert.Equal(400, ex.StatusCode);
+        Assert.Empty(convs.Plays);
+    }
+
+    [Fact]
+    public async Task MarkPlayed_OwnVoiceNote_Throws400()
+    {
+        var (sut, convs, _, _) = Build();   // caller = Me
+        var conv = Conv(Me, Other, ConversationStatus.Accepted);
+        convs.Conversations.Add(conv);
+        var voice = SeedVoice(convs, conv, sender: Me);   // I sent it
+
+        var ex = await Assert.ThrowsAsync<ValidationException>(() => sut.MarkPlayedAsync(conv.Id, voice.Id));
+        Assert.Equal(400, ex.StatusCode);   // a sender cannot manufacture their own played receipt
+        Assert.Empty(convs.Plays);
+    }
+
+    [Fact]
+    public async Task MarkPlayed_TombstonedVoiceNote_Throws400()
+    {
+        var (sut, convs, _, _) = Build();
+        var conv = Conv(Other, Me, ConversationStatus.Accepted);
+        convs.Conversations.Add(conv);
+        var voice = SeedVoice(convs, conv, sender: Other, deleted: true);
+
+        var ex = await Assert.ThrowsAsync<ValidationException>(() => sut.MarkPlayedAsync(conv.Id, voice.Id));
+        Assert.Equal(400, ex.StatusCode);
+        Assert.Empty(convs.Plays);
+    }
+
+    [Fact]
+    public async Task MarkPlayed_NotifierFailure_DoesNotFailRequest_RecordPersisted()
+    {
+        var (sut, convs, _, notifier) = Build();
+        var conv = Conv(Other, Me, ConversationStatus.Accepted);
+        convs.Conversations.Add(conv);
+        var voice = SeedVoice(convs, conv, sender: Other);
+        notifier.Throw = true;
+
+        await sut.MarkPlayedAsync(conv.Id, voice.Id);   // must not throw
+
+        Assert.Single(convs.Plays);   // persisted despite notifier throwing
+    }
+
+    [Fact]
+    public async Task PlayedFlags_BothFalse_BeforeAnyPlay()
+    {
+        var (sut, convs, _, _) = Build();
+        var conv = Conv(Other, Me, ConversationStatus.Accepted);
+        convs.Conversations.Add(conv);
+        SeedVoice(convs, conv, sender: Other);
+
+        var dto = Assert.Single((await sut.GetMessagesAsync(conv.Id, null, 30)).Items);
+        Assert.False(dto.PlayedByMe);
+        Assert.False(dto.PlayedByOther);
+    }
+
+    [Fact]
+    public async Task PlayedFlags_AreCallerRelative_BothDirectionsOnSameMessage()
+    {
+        // One voice note sent by Me; Other (the recipient) plays it. Two callers over the SAME repo.
+        var convs = new FakeConversationRepository();
+        var users = new FakeUserRepository();
+        var notifier = new RecordingChatNotifier();
+        var conv = Conv(Me, Other, ConversationStatus.Accepted);
+        convs.Conversations.Add(conv);
+        var voice = SeedVoice(convs, conv, sender: Me);
+
+        var meSvc = new ChatService(convs, users, notifier, new FakeCurrentUser { UserId = Me }, new FakeMediaStorageService(), NullLogger<ChatService>.Instance);
+        var otherSvc = new ChatService(convs, users, notifier, new FakeCurrentUser { UserId = Other }, new FakeMediaStorageService(), NullLogger<ChatService>.Instance);
+
+        await otherSvc.MarkPlayedAsync(conv.Id, voice.Id);   // the recipient plays
+
+        // Sender's view: I didn't play it, but the other participant did.
+        var mine = Assert.Single((await meSvc.GetMessagesAsync(conv.Id, null, 30)).Items);
+        Assert.False(mine.PlayedByMe);
+        Assert.True(mine.PlayedByOther);
+
+        // Player's view: I played it; from my side "other" is the sender, who did not.
+        var theirs = Assert.Single((await otherSvc.GetMessagesAsync(conv.Id, null, 30)).Items);
+        Assert.True(theirs.PlayedByMe);
+        Assert.False(theirs.PlayedByOther);
+    }
+
+    [Fact]
+    public async Task PlayedFlags_Blanked_ForTombstone()
+    {
+        var (sut, convs, _, _) = Build();   // caller = Me
+        var conv = Conv(Me, Other, ConversationStatus.Accepted);
+        convs.Conversations.Add(conv);
+        var voice = SeedVoice(convs, conv, sender: Me);
+        convs.Plays.Add(new MessagePlay { MessageId = voice.Id, UserId = Other, PlayedAt = DateTime.UtcNow });
+
+        // Before deletion: playedByOther is true from the sender's view.
+        Assert.True(Assert.Single((await sut.GetMessagesAsync(conv.Id, null, 30)).Items).PlayedByOther);
+
+        await sut.DeleteForEveryoneAsync(conv.Id, voice.Id);
+
+        var dto = Assert.Single((await sut.GetMessagesAsync(conv.Id, null, 30)).Items);
+        Assert.True(dto.IsDeleted);
+        Assert.False(dto.PlayedByMe);      // both flags blanked for a tombstone, like the media fields
+        Assert.False(dto.PlayedByOther);
+    }
+
     // ===== ACCEPT / DECLINE =====
 
     [Fact]
@@ -560,6 +1648,58 @@ public class ChatServiceTests
         await sut.MarkReadAsync(conv.Id);   // LastReadAt = now, after the message
 
         Assert.Equal(0, (await sut.GetConversationsAsync(1, 20)).Items[0].UnreadCount);
+    }
+
+    [Fact]
+    public async Task MarkRead_MovesForward_FiresConversationRead_ToOtherParticipantOnly()
+    {
+        var (sut, convs, _, notifier) = Build();   // caller = Me
+        var conv = Conv(Me, Other, ConversationStatus.Accepted);
+        convs.Conversations.Add(conv);
+        var t0 = DateTime.UtcNow.AddMinutes(-5);
+        convs.Messages.Add(new Message { Id = Guid.NewGuid(), ConversationId = conv.Id, SenderId = Other, Body = "unread", CreatedAt = t0 });
+        conv.LastMessageAt = t0;   // there IS new activity to read
+
+        await sut.MarkReadAsync(conv.Id);
+
+        var evt = Assert.Single(notifier.ConversationRead);
+        Assert.Equal(Other, evt.userId);              // the reader (Me) is NOT told they read
+        Assert.Equal(conv.Id, evt.conversationId);
+        var myPart = conv.Participants.Single(p => p.UserId == Me);
+        Assert.Equal(myPart.LastReadAt, evt.lastReadAt);   // payload carries the new watermark
+    }
+
+    [Fact]
+    public async Task MarkRead_WatermarkDoesNotMoveForward_FiresNoConversationRead()
+    {
+        var (sut, convs, _, notifier) = Build();   // caller = Me
+        var conv = Conv(Me, Other, ConversationStatus.Accepted);
+        convs.Conversations.Add(conv);
+        var t0 = DateTime.UtcNow.AddMinutes(-5);
+        convs.Messages.Add(new Message { Id = Guid.NewGuid(), ConversationId = conv.Id, SenderId = Other, Body = "already read", CreatedAt = t0 });
+        conv.LastMessageAt = t0;
+        // I've already read up to the last activity — a debounced re-mark reports nothing new.
+        conv.Participants.Single(p => p.UserId == Me).LastReadAt = t0;
+
+        await sut.MarkReadAsync(conv.Id);
+
+        Assert.Empty(notifier.ConversationRead);   // no-op read → no noise event
+    }
+
+    [Fact]
+    public async Task MarkRead_NotifierFailure_DoesNotFailRequest_WatermarkStillPersisted()
+    {
+        var (sut, convs, _, notifier) = Build();   // caller = Me
+        var conv = Conv(Me, Other, ConversationStatus.Accepted);
+        convs.Conversations.Add(conv);
+        var t0 = DateTime.UtcNow.AddMinutes(-5);
+        convs.Messages.Add(new Message { Id = Guid.NewGuid(), ConversationId = conv.Id, SenderId = Other, Body = "unread", CreatedAt = t0 });
+        conv.LastMessageAt = t0;
+        notifier.Throw = true;
+
+        await sut.MarkReadAsync(conv.Id);   // must not throw
+
+        Assert.NotNull(conv.Participants.Single(p => p.UserId == Me).LastReadAt);   // persisted despite notifier down
     }
 
     // ===== LISTS (clamp + delegation) =====
@@ -947,7 +2087,7 @@ public class ChatServiceTests
 
         // …but the other participant still sees it unchanged.
         var otherSvc = new ChatService(convs, new FakeUserRepository(), notifier,
-            new FakeCurrentUser { UserId = Other }, NullLogger<ChatService>.Instance);
+            new FakeCurrentUser { UserId = Other }, new FakeMediaStorageService(), NullLogger<ChatService>.Instance);
         var theirPage = await otherSvc.GetMessagesAsync(conv.Id, null, 30);
         Assert.Equal("hide me", Assert.Single(theirPage.Items).Body);
 
@@ -1480,8 +2620,8 @@ public class ChatServiceTests
         convs.Messages.Add(m);
         conv.LastMessageAt = t0;
 
-        var meSvc = new ChatService(convs, users, notifier, new FakeCurrentUser { UserId = Me }, NullLogger<ChatService>.Instance);
-        var otherSvc = new ChatService(convs, users, notifier, new FakeCurrentUser { UserId = Other }, NullLogger<ChatService>.Instance);
+        var meSvc = new ChatService(convs, users, notifier, new FakeCurrentUser { UserId = Me }, new FakeMediaStorageService(), NullLogger<ChatService>.Instance);
+        var otherSvc = new ChatService(convs, users, notifier, new FakeCurrentUser { UserId = Other }, new FakeMediaStorageService(), NullLogger<ChatService>.Instance);
 
         await meSvc.PinAsync(conv.Id, m.Id, new PinMessageRequestDto { Duration = PinDuration.TwentyFourHours });
 
@@ -1530,6 +2670,8 @@ public class ChatServiceTests
         public readonly List<(List<Guid> userIds, MessageDto message)> Edited = [];
         public readonly List<(List<Guid> userIds, Guid conversationId, Guid messageId)> Deleted = [];
         public readonly List<(List<Guid> userIds, Guid conversationId, Guid messageId, bool isPinned, DateTime? pinExpiresAt)> PinChanged = [];
+        public readonly List<(Guid userId, Guid conversationId, DateTime lastReadAt)> ConversationRead = [];
+        public readonly List<(Guid userId, Guid conversationId, Guid messageId)> Played = [];
         public bool Throw;
 
         public Task MessageReceivedAsync(IEnumerable<Guid> userIds, MessageDto message, CancellationToken ct = default)
@@ -1582,6 +2724,86 @@ public class ChatServiceTests
             PinChanged.Add((userIds.ToList(), conversationId, messageId, isPinned, pinExpiresAt));
             return Task.CompletedTask;
         }
+
+        public Task ConversationReadAsync(Guid userId, Guid conversationId, DateTime lastReadAt, CancellationToken ct = default)
+        {
+            if (Throw) throw new InvalidOperationException("notifier down");
+            ConversationRead.Add((userId, conversationId, lastReadAt));
+            return Task.CompletedTask;
+        }
+
+        public Task MessagePlayedAsync(Guid userId, Guid conversationId, Guid messageId, CancellationToken ct = default)
+        {
+            if (Throw) throw new InvalidOperationException("notifier down");
+            Played.Add((userId, conversationId, messageId));
+            return Task.CompletedTask;
+        }
+    }
+
+    // In-memory Cloudinary stand-in — no network. Counts uploads/deletes so tests can prove a forward
+    // does NOT re-upload and an unauthorized send never uploads. Duration is configurable for the
+    // over-length video test.
+    private sealed class FakeMediaStorageService : IMediaStorageService
+    {
+        public int ImageUploads;
+        public int VideoUploads;
+        public int AudioUploads;
+        public int DocumentUploads;
+        public readonly List<string> Deleted = [];
+        public int? VideoDurationMs = 5_000;   // default 5 s — under the 120 s limit
+        public int? AudioDurationMs = 8_000;   // default 8 s — under the 300 s limit
+
+        public MediaUploadResult ImageResult { get; set; } = new()
+        {
+            SecureUrl = "https://res.cloudinary.com/x/image/upload/v1/skillora/chat/img.jpg",
+            ThumbnailUrl = "https://res.cloudinary.com/x/image/upload/c_fill,w_400,q_auto/v1/skillora/chat/img.jpg",
+            PublicId = "skillora/chat/img", Width = 800, Height = 600, DurationMs = null, Bytes = 1234
+        };
+
+        public Task<MediaUploadResult> UploadImageAsync(Stream content, string fileName, string folder, CancellationToken ct = default)
+        {
+            ImageUploads++;
+            return Task.FromResult(ImageResult);
+        }
+
+        public Task<MediaUploadResult> UploadVideoAsync(Stream content, string fileName, string folder, CancellationToken ct = default)
+        {
+            VideoUploads++;
+            return Task.FromResult(new MediaUploadResult
+            {
+                SecureUrl = "https://res.cloudinary.com/x/video/upload/v1/skillora/chat/vid.mp4",
+                ThumbnailUrl = "https://res.cloudinary.com/x/video/upload/so_0,w_400,c_fill/v1/skillora/chat/vid.jpg",
+                PublicId = "skillora/chat/vid", Width = 1280, Height = 720, DurationMs = VideoDurationMs, Bytes = 456789
+            });
+        }
+
+        public Task<MediaUploadResult> UploadAudioAsync(Stream content, string fileName, string folder, CancellationToken ct = default)
+        {
+            AudioUploads++;
+            return Task.FromResult(new MediaUploadResult
+            {
+                SecureUrl = "https://res.cloudinary.com/x/video/upload/v1/skillora/chat/voice.m4a",
+                ThumbnailUrl = string.Empty,   // no poster for audio
+                PublicId = "skillora/chat/voice", Width = 0, Height = 0, DurationMs = AudioDurationMs, Bytes = 34567
+            });
+        }
+
+        public Task<MediaUploadResult> UploadDocumentAsync(Stream content, string fileName, string folder, CancellationToken ct = default)
+        {
+            DocumentUploads++;
+            return Task.FromResult(new MediaUploadResult
+            {
+                SecureUrl = "https://res.cloudinary.com/x/raw/upload/v1/skillora/chat/doc.pdf",
+                ThumbnailUrl = string.Empty,   // no poster for a document
+                PublicId = "skillora/chat/doc", Width = 0, Height = 0, DurationMs = null, Bytes = 4096
+            });
+        }
+
+        public Task DeleteAsync(string publicId, MediaKind kind, CancellationToken ct = default)
+        {
+            Deleted.Add(publicId);
+            return Task.CompletedTask;
+        }
     }
 
     private sealed class FakeUserRepository : IUserRepository
@@ -1604,6 +2826,7 @@ public class ChatServiceTests
         public readonly List<Message> Messages = [];
         public readonly List<MessageReaction> Reactions = [];
         public readonly List<MessageDeletion> Deletions = [];
+        public readonly List<MessagePlay> Plays = [];
         public readonly List<(Guid a, Guid b)> AcceptedConnections = [];
         public int LastMessageLimitRequested;
 
@@ -1667,6 +2890,7 @@ public class ChatServiceTests
                         BodySnippet = r.DeletedAt != null ? string.Empty
                             : (r.Body.Length > 80 ? r.Body.Substring(0, 80) : r.Body),
                         Type = r.Type,
+                        FileName = r.DeletedAt != null ? null : r.MediaFileName,
                         IsDeleted = r.DeletedAt != null
                     };
             }
@@ -1687,6 +2911,18 @@ public class ChatServiceTests
                 SystemEventType = m.SystemEventType,
                 SystemTargetMessageId = m.SystemTargetMessageId,
                 IsForwarded = m.ForwardedFromMessageId != null,
+                // Media (mirrors ProjectMessage): URLs blanked for a tombstone, dimensions kept.
+                MediaUrl = m.DeletedAt == null ? m.MediaUrl : null,
+                MediaThumbnailUrl = m.DeletedAt == null ? m.MediaThumbnailUrl : null,
+                MediaWidth = m.MediaWidth,
+                MediaHeight = m.MediaHeight,
+                MediaDurationMs = m.MediaDurationMs,
+                MediaMimeType = m.MediaMimeType,
+                MediaFileName = m.DeletedAt == null ? m.MediaFileName : null,
+                MediaWaveform = m.DeletedAt == null ? m.MediaWaveform : null,
+                // Played flags mirror ProjectMessage: caller-relative EXISTS, blanked for a tombstone.
+                PlayedByMe = m.DeletedAt == null && Plays.Any(p => p.MessageId == m.Id && p.UserId == userId),
+                PlayedByOther = m.DeletedAt == null && Plays.Any(p => p.MessageId == m.Id && p.UserId != userId),
                 ReplyTo = replyTo,
                 Reactions = reactions
             };
@@ -1757,6 +2993,10 @@ public class ChatServiceTests
         public Task<bool> HasMessageDeletionAsync(Guid messageId, Guid userId, CancellationToken ct = default) =>
             Task.FromResult(Deletions.Any(d => d.MessageId == messageId && d.UserId == userId));
 
+        public Task AddMessagePlayAsync(MessagePlay play) { Plays.Add(play); return Task.CompletedTask; }
+        public Task<bool> HasMessagePlayAsync(Guid messageId, Guid userId, CancellationToken ct = default) =>
+            Task.FromResult(Plays.Any(p => p.MessageId == messageId && p.UserId == userId));
+
         public Task<ConversationSummaryDto?> GetSummaryByIdAsync(Guid conversationId, Guid userId, CancellationToken ct = default)
         {
             var c = Conversations.FirstOrDefault(x => x.Id == conversationId && x.Participants.Any(p => p.UserId == userId));
@@ -1784,7 +3024,8 @@ public class ChatServiceTests
 
         private ConversationSummaryDto BuildSummary(Conversation c, Guid userId)
         {
-            var otherId = c.Participants.First(p => p.UserId != userId).UserId;
+            var otherPart = c.Participants.First(p => p.UserId != userId);
+            var otherId = otherPart.UserId;
             var myPart = c.Participants.First(p => p.UserId == userId);
             var last = Messages.Where(m => m.ConversationId == c.Id && m.DeletedAt == null && m.Type != MessageType.System)
                 .OrderByDescending(m => m.CreatedAt).ThenByDescending(m => m.Id).FirstOrDefault();
@@ -1798,8 +3039,10 @@ public class ChatServiceTests
                 IsRequest = c.Status == ConversationStatus.Pending && c.InitiatorId != userId,
                 OtherUser = new ConversationUserDto { UserId = otherId },
                 LastMessagePreview = last?.Body,
+                LastMessageType = last?.Type,
                 LastMessageAt = c.LastMessageAt,
-                UnreadCount = unread
+                UnreadCount = unread,
+                OtherLastReadAt = otherPart.LastReadAt   // caller-relative: the OTHER party's watermark
             };
         }
     }

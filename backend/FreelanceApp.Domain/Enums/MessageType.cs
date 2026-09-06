@@ -8,5 +8,7 @@ public enum MessageType
     Image  = 1,
     File   = 2,
     Voice  = 3,
-    System = 4   // Inline activity marker (pin/unpin). Body is always empty; client renders from SystemEventType.
+    System = 4,  // Inline activity marker (pin/unpin). Body is always empty; client renders from SystemEventType.
+    Video  = 5   // Media message (M-M4). 4 is TAKEN by System — reusing it would silently re-type every existing
+                 // pin/unpin row. Image = 1 was reserved in M1; M-M4 makes Image and Video real.
 }

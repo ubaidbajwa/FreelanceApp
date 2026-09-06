@@ -16,6 +16,11 @@ public class MessageReplyDto
 
     public MessageType Type { get; set; }
 
+    // Document filename of the quoted message (M-M8) — so a reply to a document quotes its name
+    // (contract.pdf) rather than a generic label. Null unless the quoted message is a File. One more
+    // scalar on the existing replyTo LEFT JOIN — adds no statement. Blanked when the quote is a tombstone.
+    public string? FileName { get; set; }
+
     // True when the quoted message itself was deleted-for-everyone — the client shows a
     // "message deleted" placeholder in the quote instead of the (blanked) snippet.
     public bool IsDeleted { get; set; }
