@@ -235,7 +235,10 @@ class _QuotedPreview extends StatelessWidget {
         : switch (reply.type) {
             MessageType.image => MessagingStrings.replyPhoto,
             MessageType.video => MessagingStrings.replyVideo,
-            MessageType.file => MessagingStrings.replyFile,
+            // F-M8 — a document quote shows its filename (server sends no label).
+            MessageType.file => (reply.fileName?.isNotEmpty ?? false)
+                ? reply.fileName!
+                : MessagingStrings.replyFile,
             MessageType.voice => MessagingStrings.replyVoice,
             _ => reply.bodySnippet,
           };

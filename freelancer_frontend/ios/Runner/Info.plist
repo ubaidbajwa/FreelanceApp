@@ -13,6 +13,12 @@
 	<string>Skillora needs photo library access so you can share photos and videos in your chats.</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Skillora needs microphone access to record audio when you capture a video to send.</string>
+	<!-- F-M8 documents: the document picker (UIDocumentPickerViewController, import
+	     mode) copies the chosen file into the app sandbox out-of-process, so it needs
+	     NO usage-description key and NO entitlement. open_filex (QuickLook / document
+	     interaction) and share_plus (UIActivityViewController) likewise need none.
+	     Nothing added here for document sharing — intentionally. -->
+
 	<key>CFBundleDevelopmentRegion</key>
 	<string>$(DEVELOPMENT_LANGUAGE)</string>
 	<key>CFBundleDisplayName</key>

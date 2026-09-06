@@ -5,6 +5,7 @@ import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 import 'package:image_picker/image_picker.dart';
+import 'package:file_picker/file_picker.dart';
 import 'package:app_settings/app_settings.dart';
 
 import '../../../../core/error/error_mapper.dart';
@@ -16,6 +17,8 @@ import 'forward_picker_screen.dart';
 import 'media_preview_screen.dart';
 import 'media_viewer_screen.dart';
 import '../widgets/media_bubble_content.dart';
+import '../widgets/document_bubble_content.dart';
+import '../widgets/document_caption_sheet.dart';
 import '../widgets/voice_bubble.dart';
 import '../../application/chat_notifier.dart';
 import '../../application/voice_recording_notifier.dart';
@@ -172,9 +175,9 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
 
   // ── F-M5: attachments ─────────────────────────────────────────────────────────
 
-  // Composer attachment button → sheet with exactly two options: Gallery and
-  // Camera. Documents is deliberately absent this slice (an option that does
-  // nothing is a false affordance — same reason the call icons were left out).
+  // Composer attachment button → sheet with three options: Gallery, Camera and
+  // Document. Document was deliberately absent until the backend accepted files (a
+  // dead option is a false affordance) — it works now, so it goes in.
   void _openAttachmentSheet() {
     _focus.unfocus();
     showModalBottomSheet<void>(
@@ -216,6 +219,17 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
               onTap: () {
                 Navigator.pop(sheetCtx);
                 _pickFromCamera();
+              },
+            ),
+            ListTile(
+              leading: const Icon(Icons.description_outlined, color: _navy),
+              title: const Text(
+                MessagingStrings.attachDocument,
+                style: TextStyle(color: _navy, fontWeight: FontWeight.w600),
+              ),
+              onTap: () {
+                Navigator.pop(sheetCtx);
+                _pickDocument();
               },
             ),
             const SizedBox(height: 8),
@@ -267,6 +281,50 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
       MaterialPageRoute<void>(
         builder: (_) => MediaPreviewScreen(path: picked.path, kind: kind),
       ),
+    );
+  }
+
+  // Document: pick a file restricted to the allowed extensions (the OS dialog filters
+  // out most invalid choices — a convenience, NOT the control), then validate
+  // extension + size client-side BEFORE any upload, and show the caption sheet. The
+  // server allowlist + magic-byte check remain authoritative; a file can still be
+  // 400'd there and that message is surfaced by the send path.
+  Future<void> _pickDocument() async {
+    PlatformFile? picked;
+    try {
+      picked = await FilePicker.pickFile(
+        type: FileType.custom,
+        allowedExtensions: DocumentLimits.allowedExtensions.toList(),
+      );
+    } catch (_) {
+      // Includes a denied storage permission on some Android levels.
+      if (mounted) _snack(MessagingStrings.genericError);
+      return;
+    }
+    if (picked == null || !mounted) return; // cancelled — not an error
+    final path = picked.path;
+    if (path == null) {
+      _snack(MessagingStrings.genericError);
+      return;
+    }
+    final sizeBytes = await picked.xFile.length();
+    if (!mounted) return;
+    // Validate the SAME way the server will (extension + size), naming the specific
+    // limit — rejecting locally saves a slow upload that would only earn a 400.
+    final err = validateDocumentFile(
+      fileName: picked.name,
+      lengthBytes: sizeBytes,
+    );
+    if (err != null) {
+      _snack(err);
+      return;
+    }
+    if (!mounted) return;
+    await showDocumentCaptionSheet(
+      context,
+      path: path,
+      fileName: picked.name,
+      sizeBytes: sizeBytes,
     );
   }
 
@@ -1944,9 +2002,13 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
         MessagingStrings.replyVideo,
         color,
       ),
+      // F-M8 — a document quote shows its filename (the server sends no label);
+      // middle-ellipsised so the extension survives and the row never overflows.
       MessageType.file => _replyTypeRow(
-        Icons.attach_file_rounded,
-        MessagingStrings.replyFile,
+        Icons.description_rounded,
+        (reply.fileName?.isNotEmpty ?? false)
+            ? middleEllipsize(reply.fileName!, maxChars: 24)
+            : MessagingStrings.replyFile,
         color,
       ),
       MessageType.voice => _replyTypeRow(
@@ -2238,6 +2300,7 @@ class _MessageBubble extends StatelessWidget {
     final isMedia =
         message.type == MessageType.image || message.type == MessageType.video;
     final isVoice = message.type == MessageType.voice;
+    final isFile = message.type == MessageType.file; // F-M8 document
     final hasCaption = message.body.isNotEmpty;
     final bodyText = isText
         ? message.body
@@ -2321,6 +2384,25 @@ class _MessageBubble extends StatelessWidget {
                   style: TextStyle(fontSize: 15, color: textColor),
                 ),
               ),
+            // F-M8: document — distinct icon/name/size layout with a download-open
+            // affordance. Caption (if any) renders below, like media.
+            if (isFile)
+              DocumentBubbleContent(
+                // Keyed by id so the per-message download state never leaks onto
+                // another message when the list recycles element state.
+                key: ValueKey('doc-${message.id}'),
+                message: message,
+                mine: mine,
+              ),
+            if (isFile && hasCaption)
+              Padding(
+                padding: const EdgeInsetsDirectional.only(top: 6),
+                child: Text(
+                  message.body,
+                  textAlign: TextAlign.start,
+                  style: TextStyle(fontSize: 15, color: textColor),
+                ),
+              ),
             // F-M11: voice note — avatar+badge | play/pause | waveform | meta row.
             // VoiceBubble owns the meta row (duration + ticks), so the shared meta
             // row below is suppressed for voice messages.
@@ -2331,8 +2413,9 @@ class _MessageBubble extends StatelessWidget {
                 otherLastReadAt: otherLastReadAt,
                 onRetry: onRetry,
               ),
-            // Text body (or the neutral placeholder for file/unknown) — never voice.
-            if (!isMedia && !isVoice)
+            // Text body (or the neutral placeholder for an unknown non-text type) —
+            // never media, voice or a document (each renders its own content above).
+            if (!isMedia && !isVoice && !isFile)
               Text(
                 bodyText,
                 textAlign: TextAlign.start,
@@ -2860,7 +2943,10 @@ class _PinBanner extends StatelessWidget {
     return switch (m.type) {
       MessageType.image => MessagingStrings.replyPhoto,
       MessageType.video => MessagingStrings.replyVideo,
-      MessageType.file => MessagingStrings.replyFile,
+      // F-M8 — prefer the document's filename over the generic label.
+      MessageType.file => (m.mediaFileName?.isNotEmpty ?? false)
+          ? m.mediaFileName!
+          : MessagingStrings.replyFile,
       MessageType.voice => MessagingStrings.replyVoice,
       _ => m.body,
     };

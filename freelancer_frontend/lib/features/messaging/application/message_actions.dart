@@ -421,6 +421,12 @@ String resolveConversationPreview(ConversationSummary summary) {
     MessageType.image => MessagingStrings.listPhoto,
     MessageType.video => MessagingStrings.listVideo,
     MessageType.voice => MessagingStrings.listVoice,
+    // F-M8 — a document: show its filename when the list row carries one, else the
+    // localised "Document" label (the server never sends a translatable label).
+    MessageType.file =>
+      (summary.lastMessageFileName?.isNotEmpty ?? false)
+          ? summary.lastMessageFileName!
+          : MessagingStrings.listDocument,
     _ => MessagingStrings.noMessagesYet,
   };
 }
@@ -630,4 +636,102 @@ List<int> parseWaveform(String? raw) {
     if (v != null) out.add(v.clamp(0, 100));
   }
   return out;
+}
+
+// ── Documents (F-M8) ──────────────────────────────────────────────────────────
+
+// Allowed document extensions + the size cap. These MIRROR the server (ChatService)
+// and exist only to fail fast — no one on a slow connection should wait through a
+// 20 MB upload only to receive a 400. The SERVER remains authoritative: it re-checks
+// the extension, the size, AND the magic bytes (content vs the declared type — which
+// the client CANNOT replicate) and rejects with a 400 the caller surfaces. `.zip` and
+// every executable type are deliberately ABSENT.
+class DocumentLimits {
+  DocumentLimits._();
+
+  static const int maxBytes = MessagingStrings.documentMaxMb * 1024 * 1024;
+
+  // The picker is restricted to these too (a convenience filter in the OS dialog);
+  // the allowlist here is the real client-side control, and the server is final.
+  static const Set<String> allowedExtensions = {
+    'pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'txt', 'csv',
+  };
+}
+
+// The last extension segment of a name, lowercased. '' when there is none (a name
+// ending in a dot, or with no dot at all) — callers treat '' as unsupported/no-label.
+String _extensionOf(String fileName) {
+  final dot = fileName.lastIndexOf('.');
+  if (dot < 0 || dot == fileName.length - 1) return '';
+  return fileName.substring(dot + 1).toLowerCase();
+}
+
+// The visual family a document icon belongs to, derived PURELY from the extension. A
+// single generic icon makes a list of attachments unreadable, so pdf / Word / Excel /
+// PowerPoint / plain-text each get a distinct treatment; anything else is generic.
+// CSV rides with the spreadsheet family (Excel) because spreadsheet apps are what
+// open it — the icon should hint at how the file behaves, not just its raw bytes.
+enum DocumentKind { pdf, word, excel, powerpoint, text, generic }
+
+DocumentKind documentKindForName(String fileName) {
+  return switch (_extensionOf(fileName)) {
+    'pdf' => DocumentKind.pdf,
+    'doc' || 'docx' => DocumentKind.word,
+    'xls' || 'xlsx' || 'csv' => DocumentKind.excel,
+    'ppt' || 'pptx' => DocumentKind.powerpoint,
+    'txt' => DocumentKind.text,
+    _ => DocumentKind.generic,
+  };
+}
+
+// The uppercase extension shown next to the size in the bubble (e.g. "PDF", "DOCX").
+// Empty for a name with no extension — the bubble then renders nothing there.
+String documentExtensionLabel(String fileName) =>
+    _extensionOf(fileName).toUpperCase();
+
+// Validate a picked document BEFORE uploading. Returns null when acceptable, or a
+// user-facing message naming the SPECIFIC failure — "invalid file" tells the user
+// nothing about what to do differently. The extension is checked before the size, so
+// an oversized `.zip` reports the (actionable) type problem, not the size. The client
+// CANNOT check magic bytes, so a file can pass here and still be rejected by the
+// server as inconsistent with its declared type — that 400 is surfaced verbatim.
+String? validateDocumentFile({required String fileName, required int lengthBytes}) {
+  if (!DocumentLimits.allowedExtensions.contains(_extensionOf(fileName))) {
+    return MessagingStrings.documentUnsupportedType;
+  }
+  if (lengthBytes > DocumentLimits.maxBytes) {
+    return MessagingStrings.documentTooLarge();
+  }
+  return null;
+}
+
+// Human-readable byte size for a document bubble: B / KB / MB, one decimal for MB
+// (e.g. 850 B, 12 KB, 3.4 MB). NOT formatCount — this is a byte magnitude with an
+// intrinsic unit, not a localised item count, so western digits + a fixed unit are
+// deliberate. A null/negative size reads as "0 B" rather than throwing.
+String formatFileSize(int? bytes) {
+  final b = (bytes ?? 0) < 0 ? 0 : (bytes ?? 0);
+  if (b < 1024) return '$b B';
+  final kb = b / 1024;
+  if (kb < 1024) return '${kb.round()} KB';
+  final mb = kb / 1024;
+  return '${mb.toStringAsFixed(1)} MB';
+}
+
+// Ellipsise a filename in the MIDDLE so the extension stays visible: an end-truncated
+// "Q3_financial_report_final_v2.pdf" becomes "Q3_financial_repo…", hiding ".pdf" —
+// exactly what the user needs to see. A head and a tail are kept around one ellipsis,
+// tail biased to retain the extension. Names at/under maxChars are returned unchanged;
+// a maxChars too small to keep anything degrades to just the ellipsis (never throws).
+String middleEllipsize(String name, {int maxChars = 28}) {
+  if (name.length <= maxChars) return name;
+  const ellipsis = '…';
+  final keep = maxChars - ellipsis.length;
+  // Not enough room to keep a meaningful head+tail → just the ellipsis.
+  if (keep <= 1) return ellipsis;
+  final head = (keep / 2).ceil();
+  final tail = keep - head;
+  final headPart = name.substring(0, head);
+  final tailPart = tail <= 0 ? '' : name.substring(name.length - tail);
+  return '$headPart$ellipsis$tailPart';
 }

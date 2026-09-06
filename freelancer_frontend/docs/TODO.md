@@ -101,3 +101,31 @@ Out of scope for this slice (deliberately):
   No CustomPainter change needed; the dot position already follows `progress`.
 - Transcription — a server/ML feature, no client hook exists.
 - Camera video capture / documents remain in their own slices (F-M12, later).
+
+## F-M8 — Signed / expiring media URLs (security)
+
+Cloudinary **raw** delivery URLs (documents) are publicly reachable by anyone holding
+the link — there is no auth on the asset itself; the URL *is* the capability. The
+backend recorded this trade-off. The migration path is signed or time-expiring URLs
+(Cloudinary signed URLs, or serving through an authenticated backend redirect).
+
+This matters more for a **contract/NDA shared in a hiring thread** than for a chat
+photo, so documents raise the priority. Scope when addressed:
+- Backend issues signed/expiring URLs (or a short-lived redirect endpoint) for
+  `mediaUrl` on File/media messages.
+- The client already downloads via a plain Dio in `DocumentDownloader` (no app token
+  sent to Cloudinary); it would simply consume whatever URL the server returns, so no
+  client change is expected beyond honouring an expiry (re-fetch the message/URL if a
+  download 403s on an expired link).
+
+## F-M8 — Document sharing follow-ups (out of scope this slice)
+
+- Multi-file selection — `FilePicker.pickFile` picks one; `pickFiles` (plural) plus a
+  per-file optimistic bubble would add multi-attach.
+- In-app document viewing / previews — deliberately NOT done. Untrusted files are
+  handed to the OS (open_filex) so its sandboxing applies (backend ADR). Do not add an
+  in-app renderer.
+- Zip / archive support — the server rejects `.zip` and executables by design.
+- A "downloaded / open" persistent indicator across app restarts — the cache is keyed
+  by message id in the temp dir, which the OS may clear; a persistent "downloaded"
+  badge would need its own bookkeeping.

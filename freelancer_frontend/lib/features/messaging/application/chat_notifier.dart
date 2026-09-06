@@ -69,6 +69,12 @@ class ChatMessage {
   // F-M11 voice — comma-separated 0–100 amplitude samples (≤64), or null (flat bar).
   // Set on the optimistic voice bubble from the locally captured samples too.
   final String? mediaWaveform;
+  // F-M8 document (File-type) — original filename + byte size. Set on the optimistic
+  // bubble immediately (from the pick) so the name + size show before the upload
+  // finishes, and KEPT on a failed bubble so retry re-sends without re-picking. A
+  // tombstone arrives with both blanked (server clears them like the URL).
+  final String? mediaFileName;
+  final int? mediaSizeBytes;
   // Local picked/recorded-file path — set on the optimistic bubble and KEPT on a
   // failed one so retry re-sends the SAME file without re-picking/re-recording.
   final String? mediaLocalPath;
@@ -108,6 +114,8 @@ class ChatMessage {
     this.mediaDurationMs,
     this.mediaMimeType,
     this.mediaWaveform,
+    this.mediaFileName,
+    this.mediaSizeBytes,
     this.mediaLocalPath,
     this.uploadProgress,
     this.playedByMe = false,
@@ -156,6 +164,8 @@ class ChatMessage {
     mediaDurationMs: mediaDurationMs,
     mediaMimeType: mediaMimeType,
     mediaWaveform: mediaWaveform,
+    mediaFileName: mediaFileName,
+    mediaSizeBytes: mediaSizeBytes,
     mediaLocalPath: mediaLocalPath,
     uploadProgress: uploadProgress ?? this.uploadProgress,
     playedByMe: playedByMe ?? this.playedByMe,
@@ -705,6 +715,9 @@ class ChatNotifier extends Notifier<ChatState> {
     mediaDurationMs: m.mediaDurationMs,
     mediaMimeType: m.mediaMimeType,
     mediaWaveform: m.mediaWaveform,
+    // F-M8 — document filename + size (null for non-file; blanked on a tombstone).
+    mediaFileName: m.mediaFileName,
+    mediaSizeBytes: m.mediaSizeBytes,
     // F-M11 M7 — played receipts arrive on the server entry (caller-relative).
     playedByMe: m.playedByMe,
     playedByOther: m.playedByOther,
@@ -812,6 +825,9 @@ class ChatNotifier extends Notifier<ChatState> {
         // Voice: the locally captured waveform is preserved on the failed bubble,
         // so retry re-sends it (never re-recorded). Null for image/video.
         waveform: msg.mediaWaveform,
+        // F-M8 document: the filename is preserved on the failed bubble, so retry
+        // re-sends the SAME document with its name (no re-pick). Null for media/voice.
+        fileName: msg.mediaFileName,
       );
     } else {
       await _dispatchSend(
@@ -902,12 +918,58 @@ class ChatNotifier extends Notifier<ChatState> {
     );
   }
 
+  // F-M8 — document send. Reuses the media path (same optimistic bubble, real
+  // progress, clientId reconciliation, retry-keeps-the-local-file). The optimistic
+  // bubble carries the filename + size so the document bubble renders them
+  // immediately, before the upload finishes. An in-progress reply is carried through
+  // exactly like media. `fileName` and `sizeBytes` come from the picker (the local
+  // path may be a cache copy with a mangled name, so the real name is passed
+  // explicitly and also sent to the server as the FileName field).
+  Future<void> sendDocument({
+    required String path,
+    required String fileName,
+    required int sizeBytes,
+    String? caption,
+  }) async {
+    final trimmedCaption = caption?.trim() ?? '';
+    final draft = state.draftReply; // snapshot before clearing
+    final clientId =
+        'local-${DateTime.now().microsecondsSinceEpoch}-${_clientCounter++}';
+    final optimistic = ChatMessage(
+      id: clientId,
+      senderId: '',
+      body: trimmedCaption,
+      type: MessageType.file,
+      createdAt: DateTime.now().toUtc(),
+      status: ChatSendStatus.pending,
+      isMine: true,
+      clientId: clientId,
+      replyTo: draft,
+      mediaLocalPath: path,
+      mediaFileName: fileName,
+      mediaSizeBytes: sizeBytes,
+      uploadProgress: 0.0,
+    );
+    state = state.copyWith(
+      messages: [optimistic, ...state.messages],
+      clearDraftReply: true,
+    );
+    await _dispatchSendMedia(
+      clientId,
+      path,
+      caption: trimmedCaption.isEmpty ? null : trimmedCaption,
+      replyToMessageId: draft?.messageId,
+      fileName: fileName,
+    );
+  }
+
   Future<void> _dispatchSendMedia(
     String clientId,
     String path, {
     String? caption,
     String? replyToMessageId,
     String? waveform,
+    String? fileName,
   }) async {
     try {
       final saved = await _repo.sendMediaMessage(
@@ -916,6 +978,7 @@ class ChatNotifier extends Notifier<ChatState> {
         caption: caption,
         replyToMessageId: replyToMessageId,
         waveform: waveform,
+        fileName: fileName,
         onSendProgress: (sent, total) =>
             _updateUploadProgress(clientId, sent, total),
       );
@@ -1485,6 +1548,9 @@ class ChatNotifier extends Notifier<ChatState> {
       bodySnippet: snippet,
       type: m.type,
       isDeleted: m.isDeleted,
+      // F-M8 — carry the document filename so the quoted preview shows it (the server
+      // sends no label). Null for non-file messages.
+      fileName: m.mediaFileName,
     );
   }
 

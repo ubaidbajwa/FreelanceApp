@@ -34,10 +34,12 @@ class ConversationTile extends StatelessWidget {
             summary.lastMessagePreview!.isEmpty) &&
         (summary.lastMessageType == MessageType.image ||
             summary.lastMessageType == MessageType.video ||
-            summary.lastMessageType == MessageType.voice);
+            summary.lastMessageType == MessageType.voice ||
+            summary.lastMessageType == MessageType.file); // F-M8 document
     final mediaIcon = switch (summary.lastMessageType) {
       MessageType.video => Icons.videocam_rounded,
       MessageType.voice => Icons.mic_rounded,
+      MessageType.file => Icons.description_rounded, // F-M8 document
       _ => Icons.photo_rounded,
     };
 

@@ -282,4 +282,37 @@ class MessagingStrings {
   // Voice bubble playback semantics.
   static const voicePlay = 'Play voice message';
   static const voicePlaybackPause = 'Pause voice message';
+
+  // ── Document sharing (F-M8) ─────────────────────────────────────────────────────
+
+  // Third attachment-sheet option (alongside Gallery / Camera). Added now that the
+  // backend accepts documents — an option that does nothing is a false affordance.
+  static const attachDocument = 'Document';
+
+  // Server-authoritative document limits, mirrored client-side to fail fast BEFORE a
+  // slow upload (see DocumentLimits in message_actions.dart). The MB number mirrors
+  // that constant; the server re-checks size, extension AND magic bytes (content vs
+  // the declared type — which the client cannot replicate) and is the source of truth.
+  static const documentMaxMb = 25;
+  static String documentTooLarge() =>
+      'This file is over the ${formatCount(documentMaxMb)} MB limit.';
+  // .zip and every executable type are deliberately rejected by the server.
+  static const documentUnsupportedType =
+      "That file type isn't supported. Choose a PDF, Word, Excel, "
+      'PowerPoint, text or CSV file.';
+  // NOTE: a magic-byte mismatch (content inconsistent with the declared type) can
+  // only be detected server-side. That 400 is surfaced verbatim via the send-error
+  // snackbar (ChatNotifier.sendError → _messageOf), so no client string is needed —
+  // the server's specific message is clearer than a generic client guess.
+
+  // The localised "Document" label the server never sends — conversation list for an
+  // uncaptioned file message when no filename is available at the list level.
+  static const listDocument = 'Document';
+
+  // Document bubble — download / open affordances.
+  static const documentOpenTooltip = 'Open document';
+  static const documentDownloadFailed = "Couldn't download the file.";
+  // open_filex reported no installed app can handle this type → offer to share.
+  static const documentNoHandler = 'No app can open this file type.';
+  static const documentShare = 'Share instead';
 }

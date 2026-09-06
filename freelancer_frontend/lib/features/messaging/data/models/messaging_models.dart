@@ -102,6 +102,10 @@ class ConversationSummary {
   // media ke liye client localised "Photo"/"Video" render karta hai (server label
   // deliberately nahi bhejta — dekho resolveConversationPreview).
   final MessageType? lastMessageType;
+  // F-M8 — agar aakhri message ek document hai to uska filename (backend bheje to).
+  // Uncaptioned file preview ke liye resolveConversationPreview isay use karta hai;
+  // absent/null ho to localised "Document" label par gir jata hai (additive/defensive).
+  final String? lastMessageFileName;
   final DateTime? lastMessageAt; // UTC; render pe .toLocal()
   final int unreadCount;
 
@@ -118,6 +122,7 @@ class ConversationSummary {
     required this.otherUser,
     this.lastMessagePreview,
     this.lastMessageType,
+    this.lastMessageFileName,
     this.lastMessageAt,
     this.unreadCount = 0,
     this.otherLastReadAt,
@@ -136,6 +141,7 @@ class ConversationSummary {
         lastMessageType: json['lastMessageType'] == null
             ? null
             : MessageType.fromApi(json['lastMessageType'] as int),
+        lastMessageFileName: json['lastMessageFileName'] as String?,
         lastMessageAt: json['lastMessageAt'] == null
             ? null
             : DateTime.parse(json['lastMessageAt'] as String),
@@ -157,6 +163,10 @@ class MessageReply {
   final String bodySnippet; // ~80 char preview; deleted quote pe khali
   final MessageType type;
   final bool isDeleted; // quoted message khud delete-for-everyone hua
+  // F-M8 — document ka original filename (sirf File-type quote pe set). Server koi
+  // localised "Document" label nahi bhejta (translatable nahi), is liye quoted block
+  // yeh filename dikhata hai; null/blank ho to client apna label render karta hai.
+  final String? fileName;
 
   const MessageReply({
     required this.messageId,
@@ -165,6 +175,7 @@ class MessageReply {
     required this.bodySnippet,
     required this.type,
     this.isDeleted = false,
+    this.fileName,
   });
 
   factory MessageReply.fromJson(Map<String, dynamic> json) => MessageReply(
@@ -174,6 +185,7 @@ class MessageReply {
         bodySnippet: json['bodySnippet'] as String? ?? '',
         type: MessageType.fromApi(json['type'] as int? ?? 0),
         isDeleted: json['isDeleted'] as bool? ?? false,
+        fileName: json['fileName'] as String?,
       );
 }
 
@@ -244,6 +256,11 @@ class Message {
   // F-M11 voice — comma-separated amplitude samples (0–100, ≤64), client-computed.
   // null = koi samples nahi → bubble flat bar dikhata hai. Voice pe hi set hota.
   final String? mediaWaveform;
+  // F-M8 document (File-type) — original filename + byte size. Documents ke koi
+  // thumbnail/width/height/duration/waveform nahi (sab null); size bubble mein
+  // human-readable dikhti hai. Tombstone pe server URL + filename dono blank kar deta.
+  final String? mediaFileName;
+  final int? mediaSizeBytes;
 
   // ===== F-M11 M7 played receipts (additive, voice only) =====
   // Dono caller-relative booleans, default false → parsing additive rehti hai
@@ -277,6 +294,8 @@ class Message {
     this.mediaDurationMs,
     this.mediaMimeType,
     this.mediaWaveform,
+    this.mediaFileName,
+    this.mediaSizeBytes,
     this.playedByMe = false,
     this.playedByOther = false,
   });
@@ -315,6 +334,8 @@ class Message {
         mediaDurationMs: json['mediaDurationMs'] as int?,
         mediaMimeType: json['mediaMimeType'] as String?,
         mediaWaveform: json['mediaWaveform'] as String?,
+        mediaFileName: json['mediaFileName'] as String?,
+        mediaSizeBytes: json['mediaSizeBytes'] as int?,
         playedByMe: json['playedByMe'] as bool? ?? false,
         playedByOther: json['playedByOther'] as bool? ?? false,
       );

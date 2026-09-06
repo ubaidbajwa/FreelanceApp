@@ -51,6 +51,9 @@ dependencies:
   record: ^7.1.1 # F-M11 voice notes — recording + amplitude stream for the waveform
   just_audio: ^0.10.6 # F-M11 voice playback — position stream + seeking
   path_provider: ^2.1.6 # F-M11 temp dir for the recorded voice file before upload
+  file_picker: ^12.2.0 # F-M8 document sharing — OS file dialog, restricted to allowed extensions (convenience filter; server allowlist is the control)
+  open_filex: ^4.7.0 # F-M8 hand a downloaded document to the OS handler (never render untrusted files in-app)
+  share_plus: ^13.3.0 # F-M8 fallback when no app can open a type (e.g. .csv with no spreadsheet app) — offer share instead of failing
 
 dev_dependencies:
   flutter_test:

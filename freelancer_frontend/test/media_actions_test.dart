@@ -14,6 +14,7 @@ import 'package:freelancer_frontend/features/messaging/messaging_strings.dart';
 ConversationSummary _conv({
   String? preview,
   MessageType? type,
+  String? fileName,
 }) =>
     ConversationSummary(
       id: 'c1',
@@ -22,6 +23,7 @@ ConversationSummary _conv({
       otherUser: const ConversationUser(userId: 'u2', fullName: 'Test'),
       lastMessagePreview: preview,
       lastMessageType: type,
+      lastMessageFileName: fileName,
     );
 
 void main() {
@@ -250,6 +252,35 @@ void main() {
       expect(
         resolveConversationPreview(_conv(preview: '', type: MessageType.voice)),
         MessagingStrings.listVoice,
+      );
+    });
+
+    test('empty caption + file type WITH a filename → the filename', () {
+      expect(
+        resolveConversationPreview(_conv(
+          preview: '',
+          type: MessageType.file,
+          fileName: 'contract_v2.pdf',
+        )),
+        'contract_v2.pdf',
+      );
+    });
+
+    test('empty caption + file type WITHOUT a filename → localised Document', () {
+      expect(
+        resolveConversationPreview(_conv(preview: '', type: MessageType.file)),
+        MessagingStrings.listDocument,
+      );
+    });
+
+    test('caption wins over a file filename', () {
+      expect(
+        resolveConversationPreview(_conv(
+          preview: 'here you go',
+          type: MessageType.file,
+          fileName: 'contract_v2.pdf',
+        )),
+        'here you go',
       );
     });
 

@@ -106,19 +106,23 @@ class MessagingRepository {
     String? caption,
     String? replyToMessageId,
     String? waveform, // F-M11 voice — comma-separated 0–100 samples (≤64) ya null
+    String? fileName, // F-M8 document — original filename (backend FileName field)
     void Function(int sent, int total)? onSendProgress,
     CancelToken? cancelToken,
   }) async {
     final formData = FormData.fromMap({
       'File': await MultipartFile.fromFile(
         filePath,
-        contentType: _mediaContentType(filePath),
+        contentType: _mediaContentType(fileName ?? filePath),
       ),
       // Khali/null caption include nahi — backend Caption ko optional maanta hai.
       if (caption != null && caption.isNotEmpty) 'Caption': caption,
       'ReplyToMessageId': ?replyToMessageId,
       // Waveform null ho to bhejte hi nahi — server null ko valid maanta (flat bar).
       'Waveform': ?waveform,
+      // F-M8 — document ka asli filename. Sirf File-type par set; server ise store
+      // karta aur MessageDto.mediaFileName mein wapas bhejta. Image/video pe null.
+      'FileName': ?fileName,
     });
     final response = await _dio.post(
       '/api/conversations/$conversationId/messages/media',
@@ -146,6 +150,19 @@ class MessagingRepository {
       'm4a' => MediaType('audio', 'mp4'), // F-M11 aacLc recording
       'aac' => MediaType('audio', 'aac'),
       'opus' || 'ogg' => MediaType('audio', 'ogg'),
+      // F-M8 documents — declared type only; server still verifies by magic bytes.
+      'pdf' => MediaType('application', 'pdf'),
+      'doc' => MediaType('application', 'msword'),
+      'docx' => MediaType('application',
+          'vnd.openxmlformats-officedocument.wordprocessingml.document'),
+      'xls' => MediaType('application', 'vnd.ms-excel'),
+      'xlsx' => MediaType('application',
+          'vnd.openxmlformats-officedocument.spreadsheetml.sheet'),
+      'ppt' => MediaType('application', 'vnd.ms-powerpoint'),
+      'pptx' => MediaType('application',
+          'vnd.openxmlformats-officedocument.presentationml.presentation'),
+      'txt' => MediaType('text', 'plain'),
+      'csv' => MediaType('text', 'csv'),
       _ => MediaType('application', 'octet-stream'),
     };
   }

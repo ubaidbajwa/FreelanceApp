@@ -101,6 +101,7 @@ class _FakeRepo implements MessagingRepository {
           {String? caption,
           String? replyToMessageId,
           String? waveform,
+          String? fileName,
           void Function(int, int)? onSendProgress,
           CancelToken? cancelToken}) =>
       Future.error(UnimplementedError());

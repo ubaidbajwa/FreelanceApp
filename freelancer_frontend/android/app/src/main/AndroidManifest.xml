@@ -55,5 +55,15 @@
             <action android:name="android.intent.action.PROCESS_TEXT"/>
             <data android:mimeType="text/plain"/>
         </intent>
+        <!-- F-M8 documents: file_picker uses the Storage Access Framework, which needs
+             NO storage permission. This VIEW query lets open_filex resolve an installed
+             app to open a downloaded document under Android 11+ package visibility —
+             without it, ACTION_VIEW resolution can wrongly report "no app" on API 30+.
+             open_filex and share_plus bundle their own FileProvider, so none is declared
+             here. -->
+        <intent>
+            <action android:name="android.intent.action.VIEW"/>
+            <data android:mimeType="*/*"/>
+        </intent>
     </queries>
 </manifest>
